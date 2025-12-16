@@ -91,7 +91,7 @@ export async function sendEmail({ to, subject, text, html }: SendEmailParams) {
 
     const msg: MailDataRequired = {
       to,
-      from: process.env.SENDGRID_FROM_EMAIL || 'noreply@hippiekit.com',
+      from: process.env.SENDGRID_FROM_EMAIL || 'developer@punch.cool',
       subject,
       html: emailHtml,
       text,
