@@ -5,6 +5,7 @@ import express, { Request, Response } from 'express';
 import cors from 'cors';
 import authRoutes from './routes/auth.js';
 import favoriteRoutes from './routes/favorites.js';
+import wordpressRoutes from './routes/wordpress.js';
 import connectDB from './config/db.js';
 
 const PORT = process.env.PORT || 8000;
@@ -73,6 +74,8 @@ connectDB();
 app.use('/api/auth', authRoutes);
 // === Favorites Routes ===
 app.use('/api/favorites', favoriteRoutes);
+// === WordPress Proxy Routes ===
+app.use('/api/wordpress', wordpressRoutes);
 
 // Health check
 app.get('/', (_req: Request, res: Response) => {
