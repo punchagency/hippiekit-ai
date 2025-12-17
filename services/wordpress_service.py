@@ -1,0 +1,179 @@
+import requests
+from typing import List, Dict, Any, Optional
+import os
+
+class WordPressService:
+    """
+    Service for fetching product data from WordPress REST API.
+    """
+
+    def __init__(self, api_url: str = None):
+        """
+        Initialize WordPress service.
+
+        Args:
+            api_url: WordPress REST API URL for products
+        """
+        self.api_url = api_url or os.getenv(
+            'WORDPRESS_API_URL',
+            'https://dodgerblue-otter-660921.hostingersite.com/wp-json/wp/v2/products/'
+        )
+        # Get base URL for media requests
+        self.base_url = self.api_url.split('/wp-json')[0]
+
+    def fetch_products(self, max_products: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Fetch products from WordPress API.
+
+        Args:
+            max_products: Maximum number of products to fetch (None for all)
+
+        Returns:
+            List of product dictionaries
+        """
+        products = []
+        page = 1
+        per_page = 100  # WordPress API max per page
+
+        print(f"Fetching products from WordPress API...")
+
+        while True:
+            # Build request URL
+            params = {
+                'page': page,
+                'per_page': per_page
+            }
+
+            try:
+                response = requests.get(self.api_url, params=params, timeout=30)
+                response.raise_for_status()
+
+                batch = response.json()
+
+                # No more products
+                if not batch:
+                    break
+
+                # Process products in this batch
+                for product in batch:
+                    processed_product = self._process_product(product)
+
+                    # Only include products with images
+                    if processed_product and processed_product.get('image_url'):
+                        products.append(processed_product)
+
+                        # Check if we've reached max_products
+                        if max_products and len(products) >= max_products:
+                            print(f"Reached max_products limit: {max_products}")
+                            return products
+
+                print(f"Fetched page {page}: {len(batch)} products (total with images: {len(products)})")
+
+                # Check if there are more pages
+                total_pages = int(response.headers.get('X-WP-TotalPages', page))
+                if page >= total_pages:
+                    break
+
+                page += 1
+
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching products on page {page}: {e}")
+                break
+
+        print(f"Total products fetched: {len(products)}")
+        return products
+
+    def _get_media_url(self, media_id: int) -> Optional[str]:
+        """
+        Fetch the media URL for a given media ID.
+
+        Args:
+            media_id: WordPress media ID
+
+        Returns:
+            Media URL or None
+        """
+        if not media_id:
+            return None
+
+        try:
+            media_url = f'{self.base_url}/wp-json/wp/v2/media/{media_id}'
+            response = requests.get(media_url, timeout=10)
+            response.raise_for_status()
+            media = response.json()
+            return media.get('source_url')
+        except Exception as e:
+            print(f"Error fetching media {media_id}: {e}")
+            return None
+
+    def _process_product(self, product: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Process a raw product from WordPress API.
+
+        Args:
+            product: Raw product data from API
+
+        Returns:
+            Processed product dictionary or None if invalid
+        """
+        try:
+            # Extract featured image
+            image_url = None
+            
+            # Try featured_media_url first
+            if 'featured_media_url' in product:
+                image_url = product['featured_media_url']
+            # Try better_featured_image
+            elif 'better_featured_image' in product:
+                image_url = product['better_featured_image'].get('source_url')
+            # Try yoast og_image
+            elif 'yoast_head_json' in product and 'og_image' in product['yoast_head_json']:
+                og_images = product['yoast_head_json']['og_image']
+                if og_images and len(og_images) > 0:
+                    image_url = og_images[0].get('url')
+            # Try to fetch from featured_media ID
+            elif product.get('featured_media'):
+                image_url = self._get_media_url(product['featured_media'])
+
+            # Extract title
+            title = product.get('title', {})
+            if isinstance(title, dict):
+                title = title.get('rendered', '')
+
+            # Extract description
+            description = product.get('excerpt', {})
+            if isinstance(description, dict):
+                description = description.get('rendered', '')
+
+            # Clean HTML from description
+            import re
+            description = re.sub('<[^<]+?>', '', description).strip()
+
+            # Get price (if available)
+            price = product.get('price', product.get('regular_price', ''))
+
+            return {
+                'id': product.get('id'),
+                'name': title,
+                'price': price,
+                'image_url': image_url,
+                'permalink': product.get('link', ''),
+                'description': description
+            }
+
+        except Exception as e:
+            print(f"Error processing product {product.get('id')}: {e}")
+            return None
+
+
+# Global instance
+_wordpress_service_instance = None
+
+def get_wordpress_service() -> WordPressService:
+    """Get or create the global WordPress service instance."""
+    global _wordpress_service_instance
+
+    if _wordpress_service_instance is None:
+        _wordpress_service_instance = WordPressService()
+
+    return _wordpress_service_instance
