@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+
+# Git
+.git/
+.gitignore
+
+# Local data and secrets
+data/*.db
+.env
+
+# Node/build artifacts (if any)
+dist/
+build/

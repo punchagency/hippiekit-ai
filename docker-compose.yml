@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: hippiekit-ai-api
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      # Override reload in production by setting UVICORN_RELOAD=false
+      - UVICORN_RELOAD=true
+      - HOST=0.0.0.0
+      - PORT=8001
+    volumes:
+      - .:/app
+    restart: unless-stopped
