@@ -10,3 +10,4 @@ torch==2.2.2
 numpy==1.26.2
 huggingface-hub==0.20.0
 transformers==4.40.2
+transformers==4.40.2
