@@ -4,10 +4,11 @@ from dotenv import load_dotenv
 import uvicorn
 import os
 
-from routers import scan_router, index_router
-
-# Load environment variables
+# Load environment variables before importing routers so imports see keys
 load_dotenv()
+
+from routers import scan_router, index_router
+from routers.identify import router as identify_router
 
 # Create FastAPI app
 app = FastAPI(
@@ -28,6 +29,7 @@ app.add_middleware(
 # Include routers
 app.include_router(scan_router, tags=["scan"])
 app.include_router(index_router, tags=["index"])
+app.include_router(identify_router, tags=["product-identification"])
 
 @app.get("/")
 async def root():

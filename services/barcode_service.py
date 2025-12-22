@@ -1,11 +1,14 @@
 """
 Barcode Product Lookup Service
 Queries Open Food Facts, Open Beauty Facts, and Open Product Facts APIs
+Includes web search fallback for products with empty ingredient data
 """
 
 import requests
 from typing import Optional, Dict, Any, List
 import logging
+from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations
+from services.web_search_service import web_search_service
 
 logger = logging.getLogger(__name__)
 
@@ -20,11 +23,13 @@ class BarcodeService:
     
     def __init__(self):
         self.timeout = 10  # seconds
+        self.web_search = web_search_service
         
-    def lookup_barcode(self, barcode: str) -> Optional[Dict[str, Any]]:
+    async def lookup_barcode(self, barcode: str) -> Optional[Dict[str, Any]]:
         """
         Look up a product by barcode across all Open*Facts databases.
         Tries each database in order until a product is found.
+        If found but ingredients are empty, attempts web search fallback.
         
         Args:
             barcode: Product barcode (UPC, EAN, etc.)
@@ -46,7 +51,7 @@ class BarcodeService:
                 
                 if product_data:
                     logger.info(f"Product found in {db_name}")
-                    normalized = self._normalize_product_data(product_data, db_name)
+                    normalized = await self._normalize_product_data(product_data, db_name)
                     return normalized
                     
             except Exception as e:
@@ -84,16 +89,17 @@ class BarcodeService:
             logger.error(f"API request failed: {str(e)}")
             return None
     
-    def _normalize_product_data(self, product: Dict[str, Any], source: str) -> Dict[str, Any]:
+    async def _normalize_product_data(self, product: Dict[str, Any], source: str) -> Dict[str, Any]:
         """
         Normalize product data from different Open*Facts APIs into a consistent format
+        Includes web search fallback if ingredients are missing
         
         Args:
             product: Raw product data from API
             source: Name of the source database
             
         Returns:
-            Normalized product dictionary
+            Normalized product dictionary with chemical analysis
         """
         # Extract common fields
         normalized = {
@@ -113,7 +119,81 @@ class BarcodeService:
             "url": product.get("url", ""),
         }
         
+        # === Get ingredients text for chemical checking ===
+        ingredients_text = (
+            product.get("ingredients_text", "") or 
+            product.get("ingredients_text_en", "")
+        )
+        
+        # === NEW: Web Search Fallback if ingredients empty ===
+        data_source = "database"
+        confidence = "high"
+        ingredients_note = None
+        
+        if not ingredients_text or len(ingredients_text.strip()) < 10:
+            logger.info(f"Ingredients empty in database for {normalized['name']}, attempting web search...")
+            
+            # Try web search for ingredients
+            web_result = await self.web_search.search_product_ingredients(
+                product_name=normalized['name'],
+                brand=normalized['brand'],
+                category=normalized['categories'].split(',')[0] if normalized['categories'] else None
+            )
+            
+            if web_result and web_result.get('ingredients'):
+                ingredients_text = web_result['ingredients']
+                data_source = web_result['source']
+                confidence = web_result['confidence']
+                ingredients_note = web_result['note']
+                logger.info(f"Ingredients found via {data_source} with {confidence} confidence")
+        
+        # Check for harmful chemicals
+        chemical_flags = check_ingredients(ingredients_text) if ingredients_text else []
+        safety_score = calculate_safety_score(chemical_flags)
+        
+        # Get product category for targeted recommendations
+        category = product.get("categories", "").split(",")[0].strip() if product.get("categories") else None
+        recommendations = generate_recommendations(chemical_flags, category)
+        
+        # Add chemical analysis to response
+        normalized["chemical_analysis"] = {
+            "flags": [
+                {
+                    "chemical": flag["chemical"],
+                    "category": flag["category"],
+                    "severity": flag["severity"],
+                    "why_flagged": self._get_chemical_explanation(flag["chemical"], flag["category"])
+                }
+                for flag in chemical_flags
+            ],
+            "safety_score": safety_score,
+            "recommendations": recommendations,
+            "data_source": data_source,
+            "confidence": confidence
+        }
+        
+        # Add note if ingredients from web search
+        if ingredients_note:
+            normalized["ingredients_note"] = ingredients_note
+        
         return normalized
+    
+    def _get_chemical_explanation(self, chemical: str, category: str) -> str:
+        """Get brief explanation for why a chemical is flagged"""
+        explanations = {
+            "Preservatives": "Preservative that may cause irritation or hormonal disruption",
+            "Surfactants": "Harsh cleaning agent that can strip natural oils and cause irritation",
+            "Fragrance": "Undisclosed chemical mixture that may contain allergens and toxins",
+            "Dyes": "Synthetic colorant linked to allergies and potential health risks",
+            "Sweeteners": "Artificial sweetener with potential metabolic and neurological effects",
+            "Seed Oils": "Highly processed oil prone to oxidation and inflammation",
+            "Plastics": "Plastic-derived chemical that may leach into products",
+            "PFAS": "Forever chemical that accumulates in body and environment",
+            "Pesticides": "Toxic agricultural chemical with potential carcinogenic effects",
+            "Heavy Metals": "Toxic metal that accumulates in body and causes organ damage",
+            "Sunscreen": "Chemical UV filter that may disrupt hormones and harm coral reefs",
+        }
+        return explanations.get(category, f"{category} chemical with potential health concerns")
     
     def _get_best_image(self, product: Dict[str, Any]) -> str:
         """

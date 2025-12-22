@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from models import get_clip_embedder
 from services import get_pinecone_service
 from services.barcode_service import get_barcode_service
+from services.vision_service import get_vision_service
 
 router = APIRouter()
 
@@ -110,7 +111,7 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
         
         # Query barcode service
         barcode_service = get_barcode_service()
-        product_data = barcode_service.lookup_barcode(barcode)
+        product_data = await barcode_service.lookup_barcode(barcode)
         
         if product_data:
             return {
@@ -134,4 +135,56 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
         raise HTTPException(
             status_code=500,
             detail=f"Error looking up barcode: {str(e)}"
+        )
+
+
+@router.post("/scan-vision")
+async def scan_product_vision(image: UploadFile = File(...)) -> Dict[str, Any]:
+    """
+    Analyze a product image using OpenAI Vision to extract visible text, ingredients,
+    packaging information, and provide health/eco recommendations.
+    """
+    import logging
+    import traceback
+    logger = logging.getLogger(__name__)
+    
+    try:
+        logger.info(f"Received vision scan request: {image.filename}, content_type: {image.content_type}")
+        
+        if not image.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="File must be an image")
+
+        logger.info("Reading image bytes...")
+        image_bytes = await image.read()
+        logger.info(f"Image bytes read: {len(image_bytes)} bytes")
+
+        # Analyze via Vision service
+        logger.info("Getting Vision service instance...")
+        vision_service = get_vision_service()
+        
+        logger.info("Starting image analysis...")
+        analysis = vision_service.analyze_product_image(image_bytes)
+
+        if analysis is None:
+            logger.error("Vision analysis returned None")
+            return {
+                "success": False,
+                "message": "Vision analysis failed. Check server logs for details.",
+                "analysis": None,
+            }
+
+        logger.info("Vision analysis completed successfully")
+        return {
+            "success": True,
+            "analysis": analysis,
+            "message": "Vision analysis completed",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during vision scan: {type(e).__name__}: {str(e)}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error analyzing image: {type(e).__name__}: {str(e)}"
         )
