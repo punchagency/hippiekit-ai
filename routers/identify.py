@@ -9,6 +9,7 @@ from services.vision_service import get_vision_service
 from services.barcode_service import BarcodeService
 from services.web_search_service import web_search_service
 from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations
+from routers.scan import get_detailed_ingredient_descriptions, analyze_packaging_material
 from openai import OpenAI
 import os
 import json
@@ -21,7 +22,7 @@ router = APIRouter(prefix="/identify", tags=["product-identification"])
 barcode_service = BarcodeService()
 
 
-def get_ingredient_descriptions(ingredients_list: list, harmful_chemicals: list) -> dict:
+def get_ingredient_descriptions_legacy(ingredients_list: list, harmful_chemicals: list) -> dict:
     """
     Generate AI descriptions for ingredients.
     Safe ingredients: GPT-4o-mini generates brief 1-sentence descriptions
@@ -224,7 +225,24 @@ def merge_database_and_vision(
     
     # Get ingredient descriptions
     ingredients_list = [ing.strip() for ing in ingredients_text.split(',')] if ingredients_text else []
-    ingredient_descriptions = get_ingredient_descriptions(ingredients_list, chemical_flags)
+    ingredient_descriptions = get_detailed_ingredient_descriptions(ingredients_list, chemical_flags)
+    
+    # Analyze packaging materials
+    packaging_text = db_data.get('packaging', '') or vision_data.get('container_info', {}).get('material', '')
+    packaging_tags = db_data.get('packaging_tags', [])
+    
+    if packaging_text or packaging_tags:
+        logger.info(f"Analyzing packaging materials: {packaging_text}")
+        packaging_analysis = analyze_packaging_material(packaging_text, packaging_tags)
+        logger.info(f"Packaging analysis complete: {len(packaging_analysis.get('materials', []))} materials identified")
+    else:
+        logger.info("No packaging information available")
+        packaging_analysis = {
+            "materials": [],
+            "analysis": {},
+            "overall_safety": "unknown",
+            "summary": "No packaging information available"
+        }
     
     response = {
         "product_name": db_data.get('product_name') or vision_data['product_name'],
@@ -257,7 +275,8 @@ def merge_database_and_vision(
             "data_source": data_source,
             "confidence": confidence
         },
-        "ingredient_descriptions": ingredient_descriptions
+        "ingredient_descriptions": ingredient_descriptions,
+        "packaging_analysis": packaging_analysis
     }
     
     if ingredients_note:
@@ -325,7 +344,24 @@ async def ai_only_analysis(image_bytes: bytes, product_info: dict) -> dict:
     
     # Get ingredient descriptions
     ingredients_list = [ing.strip() for ing in ingredients_text.split(',')] if ingredients_text and ingredients_text != "Could not extract ingredients from image" else []
-    ingredient_descriptions = get_ingredient_descriptions(ingredients_list, chemical_flags)
+    ingredient_descriptions = get_detailed_ingredient_descriptions(ingredients_list, chemical_flags)
+    
+    # Analyze packaging materials
+    packaging_text = product_info.get('container_info', {}).get('material', '')
+    packaging_tags = []
+    
+    if packaging_text:
+        logger.info(f"Analyzing packaging materials: {packaging_text}")
+        packaging_analysis = analyze_packaging_material(packaging_text, packaging_tags)
+        logger.info(f"Packaging analysis complete: {len(packaging_analysis.get('materials', []))} materials identified")
+    else:
+        logger.info("No packaging information available")
+        packaging_analysis = {
+            "materials": [],
+            "analysis": {},
+            "overall_safety": "unknown",
+            "summary": "No packaging information available"
+        }
     
     response = {
         "product_name": product_info.get('product_name', ''),
@@ -353,7 +389,8 @@ async def ai_only_analysis(image_bytes: bytes, product_info: dict) -> dict:
             "data_source": data_source,
             "confidence": confidence
         },
-        "ingredient_descriptions": ingredient_descriptions
+        "ingredient_descriptions": ingredient_descriptions,
+        "packaging_analysis": packaging_analysis
     }
     
     if ingredients_note:
