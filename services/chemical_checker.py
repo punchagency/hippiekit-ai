@@ -70,10 +70,13 @@ CHEMICALS = {
     "Red 40": {"category": "Dyes", "severity": HIGH, "aliases": ["allura red", "e129"]},
     "Yellow 5": {"category": "Dyes", "severity": HIGH, "aliases": ["tartrazine", "e102"]},
     "Yellow 6": {"category": "Dyes", "severity": HIGH, "aliases": ["sunset yellow", "e110"]},
-    "Blue 1": {"category": "Dyes", "severity": MODERATE, "aliases": ["brilliant blue", "e133"]},
+    "Blue 1": {"category": "Dyes", "severity": MODERATE, "aliases": ["brilliant blue", "e133", "blue no. 1", "blue no 1", "fd&c blue 1"]},
     "Blue 2": {"category": "Dyes", "severity": MODERATE, "aliases": ["indigotine", "e132"]},
     "Green 3": {"category": "Dyes", "severity": HIGH, "aliases": []},
     "Red 3": {"category": "Dyes", "severity": HIGH, "aliases": ["erythrosine", "e127"]},
+    "Red 40": {"category": "Dyes", "severity": HIGH, "aliases": ["allura red", "e129", "red no. 40", "red no 40", "fd&c red 40"]},
+    "Yellow 5": {"category": "Dyes", "severity": HIGH, "aliases": ["tartrazine", "e102", "yellow no. 5", "yellow no 5", "fd&c yellow 5"]},
+    "Yellow 6": {"category": "Dyes", "severity": HIGH, "aliases": ["sunset yellow", "e110", "yellow no. 6", "yellow no 6", "fd&c yellow 6"]},
     "Caramel Color": {"category": "Dyes", "severity": MODERATE, "aliases": ["e150", "caramel"]},
     "Coal Tar Dyes": {"category": "Dyes", "severity": CRITICAL, "aliases": ["coal tar"]},
     "Carbon Black": {"category": "Dyes", "severity": CRITICAL, "aliases": []},
@@ -90,6 +93,38 @@ CHEMICALS = {
     "Ethyl Butyrate": {"category": "Flavors", "severity": MODERATE, "aliases": []},
     "Propylene Glycol": {"category": "Flavors", "severity": MODERATE, "aliases": ["pg", "1,2-propanediol"]},
     "Triacetin": {"category": "Flavors", "severity": LOW, "aliases": ["glyceryl triacetate"]},
+    "Flavourings": {"category": "Flavors", "severity": HIGH, "aliases": ["flavorings", "flavoring", "flavouring", "natural flavourings", "natural flavorings", "artificial flavourings", "artificial flavorings"]},
+    "Natural Flavor": {"category": "Flavors", "severity": MODERATE, "aliases": ["natural flavors", "natural flavour", "natural flavours"]},
+    "Artificial Flavor": {"category": "Flavors", "severity": HIGH, "aliases": ["artificial flavors", "artificial flavour", "artificial flavours"]},
+    
+    # ========== ULTRA-PROCESSED ADDITIVES & STARCHES ==========
+    "Maltodextrin": {"category": "Processing Aids", "severity": HIGH, "aliases": []},
+    "Dextrin": {"category": "Processing Aids", "severity": HIGH, "aliases": []},
+    "Modified Starch": {"category": "Processing Aids", "severity": HIGH, "aliases": ["modified corn starch", "modified food starch", "modified tapioca starch", "modified potato starch"]},
+    "Modified Corn Starch": {"category": "Processing Aids", "severity": HIGH, "aliases": []},
+    "Modified Food Starch": {"category": "Processing Aids", "severity": HIGH, "aliases": []},
+    "Corn Syrup Solids": {"category": "Processing Aids", "severity": HIGH, "aliases": []},
+    "High Fructose Corn Syrup": {"category": "Processing Aids", "severity": CRITICAL, "aliases": ["hfcs"]},
+    "Glucose-Fructose Syrup": {"category": "Processing Aids", "severity": HIGH, "aliases": []},
+    "Invert Sugar": {"category": "Processing Aids", "severity": MODERATE, "aliases": ["invert sugar syrup"]},
+    "Hydrolyzed Vegetable Protein": {"category": "Processing Aids", "severity": MODERATE, "aliases": ["hvp", "hydrolyzed soy protein"]},
+    "Yeast Extract": {"category": "Processing Aids", "severity": MODERATE, "aliases": []},
+    "Monosodium Glutamate": {"category": "Processing Aids", "severity": HIGH, "aliases": ["msg", "e621"]},
+    "Disodium Guanylate": {"category": "Processing Aids", "severity": MODERATE, "aliases": ["e627"]},
+    "Disodium Inosinate": {"category": "Processing Aids", "severity": MODERATE, "aliases": ["e631"]},
+    
+    # ========== EMULSIFIERS & STABILIZERS ==========
+    "Carrageenan": {"category": "Thickeners", "severity": MODERATE, "aliases": ["e407"]},
+    "Xanthan Gum": {"category": "Thickeners", "severity": LOW, "aliases": ["e415"]},
+    "Guar Gum": {"category": "Thickeners", "severity": LOW, "aliases": ["e412"]},
+    "Locust Bean Gum": {"category": "Thickeners", "severity": LOW, "aliases": ["e410", "carob gum"]},
+    "Cellulose Gum": {"category": "Thickeners", "severity": MODERATE, "aliases": ["cmc", "e466", "carboxymethyl cellulose"]},
+    "Microcrystalline Cellulose": {"category": "Thickeners", "severity": MODERATE, "aliases": ["e460"]},
+    "Mono and Diglycerides": {"category": "Emulsifiers", "severity": MODERATE, "aliases": ["e471", "monoglycerides", "diglycerides"]},
+    "Soy Lecithin": {"category": "Emulsifiers", "severity": MODERATE, "aliases": ["lecithin", "e322"]},
+    "Polysorbate 65": {"category": "Emulsifiers", "severity": MODERATE, "aliases": []},
+    "Sodium Stearoyl Lactylate": {"category": "Emulsifiers", "severity": MODERATE, "aliases": ["ssl", "e481"]},
+    "DATEM": {"category": "Emulsifiers", "severity": MODERATE, "aliases": ["e472e", "diacetyl tartaric acid esters"]},
     
     # ========== SWEETENERS ==========
     "Aspartame": {"category": "Sweeteners", "severity": CRITICAL, "aliases": []},
@@ -235,6 +270,7 @@ SEARCH_PATTERNS = build_search_patterns()
 def check_ingredients(ingredient_text: str) -> List[Dict[str, Any]]:
     """
     Check ingredient text for harmful chemicals.
+    Enhanced to catch E-numbers in parentheses like 'Red 40 (E129)' or 'Tartrazine (E102)'.
     
     Args:
         ingredient_text: Text containing ingredients (from label, database, etc.)
@@ -255,9 +291,22 @@ def check_ingredients(ingredient_text: str) -> List[Dict[str, Any]]:
     for pattern, chem_info in SEARCH_PATTERNS.items():
         # Use word boundary matching to avoid partial matches
         # e.g., "paraben" shouldn't match "paraben-free"
-        regex = r'\b' + re.escape(pattern) + r'\b'
+        # Enhanced: Also check for patterns in parentheses and with optional 's' for plurals
         
-        if re.search(regex, text_lower):
+        # Pattern 1: Standard word boundary match with optional plural
+        regex1 = r'\b' + re.escape(pattern) + r's?\b'
+        
+        # Pattern 2: Inside parentheses (e.g., "Tartrazine (E102)")
+        regex2 = r'\(' + re.escape(pattern) + r's?\)'
+        
+        # Pattern 3: After hyphen or slash (e.g., "color-e102" or "dye/e129")
+        regex3 = r'[-/]' + re.escape(pattern) + r's?\b'
+        
+        # Check all patterns
+        if (re.search(regex1, text_lower) or 
+            re.search(regex2, text_lower) or 
+            re.search(regex3, text_lower)):
+            
             chem_name = chem_info["name"]
             
             # Only add once even if multiple aliases match

@@ -1,6 +1,9 @@
 import requests
 from typing import List, Dict, Any, Optional
 import os
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 class WordPressService:
     """
@@ -20,6 +23,18 @@ class WordPressService:
         )
         # Get base URL for media requests
         self.base_url = self.api_url.split('/wp-json')[0]
+        
+        # Create session with retry strategy
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=5,  # Total retries
+            backoff_factor=1,  # Wait 1, 2, 4, 8, 16 seconds between retries
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     def fetch_products(self, max_products: Optional[int] = None) -> List[Dict[str, Any]]:
         """
@@ -36,6 +51,23 @@ class WordPressService:
         per_page = 100  # WordPress API max per page
 
         print(f"Fetching products from WordPress API...")
+        print(f"API URL: {self.api_url}")
+        
+        # Test connection first
+        try:
+            print("Testing connection to WordPress...")
+            test_response = self.session.get(self.api_url, params={'page': 1, 'per_page': 1}, timeout=30)
+            test_response.raise_for_status()
+            print(f"✅ Connection successful! WordPress is accessible.")
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Cannot connect to WordPress API: {e}")
+            print(f"   URL: {self.api_url}")
+            print(f"\n💡 Troubleshooting:")
+            print(f"   1. Check if the WordPress site is online")
+            print(f"   2. Verify the URL is correct in .env file (WORDPRESS_API_URL)")
+            print(f"   3. Check your internet connection")
+            print(f"   4. Try accessing {self.base_url} in your browser")
+            return []
 
         while True:
             # Build request URL
@@ -45,7 +77,7 @@ class WordPressService:
             }
 
             try:
-                response = requests.get(self.api_url, params=params, timeout=30)
+                response = self.session.get(self.api_url, params=params, timeout=30)
                 response.raise_for_status()
 
                 batch = response.json()

@@ -19,7 +19,7 @@ class BarcodeService:
     # API endpoints for different product databases
     OPENFOODFACTS_API = "https://world.openfoodfacts.org/api/v2/product/{barcode}"
     OPENBEAUTYFACTS_API = "https://world.openbeautyfacts.org/api/v2/product/{barcode}"
-    OPENPRODUCTFACTS_API = "https://world.openproductfacts.org/api/v2/product/{barcode}"
+    OPENPRODUCTSFACTS_API = "https://world.openproductsfacts.org/api/v2/product/{barcode}"  # Note: productSfacts with 's'
     
     def __init__(self):
         self.timeout = 10  # seconds
@@ -41,7 +41,7 @@ class BarcodeService:
         databases = [
             ("OpenFoodFacts", self.OPENFOODFACTS_API),
             ("OpenBeautyFacts", self.OPENBEAUTYFACTS_API),
-            ("OpenProductFacts", self.OPENPRODUCTFACTS_API),
+            ("OpenProductsFacts", self.OPENPRODUCTSFACTS_API),  # Updated reference
         ]
         
         for db_name, api_url in databases:
