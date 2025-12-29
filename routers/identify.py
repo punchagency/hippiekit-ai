@@ -3,13 +3,13 @@ Product Identification Router
 Identifies products from front-facing photos and retrieves complete information
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 from services.vision_service import get_vision_service
 from services.barcode_service import BarcodeService
 from services.web_search_service import web_search_service
 from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations
-from routers.scan import get_detailed_ingredient_descriptions, analyze_packaging_material
+from routers.scan import get_detailed_ingredient_descriptions, analyze_packaging_material, separate_ingredients_with_ai, search_packaging_info
 from openai import OpenAI
 import os
 import json
@@ -170,7 +170,7 @@ async def identify_product(image: UploadFile = File(...)):
                 ingredients_note = None
             
             # Merge database info with vision info
-            response = merge_database_and_vision(
+            response = await merge_database_and_vision(
                 database_result, 
                 product_info, 
                 ingredients_text,
@@ -207,7 +207,7 @@ async def search_database_by_name(product_name: str, brand: str):
     return None
 
 
-def merge_database_and_vision(
+async def merge_database_and_vision(
     db_data: dict,
     vision_data: dict,
     ingredients_text: str,
@@ -223,13 +223,48 @@ def merge_database_and_vision(
     category = db_data.get('categories', '').split(',')[0] if db_data.get('categories') else vision_data.get('category')
     recommendations = generate_recommendations(chemical_flags, category)
     
-    # Get ingredient descriptions
+    # Get ingredient descriptions with AI separation (ensures no duplicates between safe/harmful)
     ingredients_list = [ing.strip() for ing in ingredients_text.split(',')] if ingredients_text else []
-    ingredient_descriptions = get_detailed_ingredient_descriptions(ingredients_list, chemical_flags)
     
-    # Analyze packaging materials
+    if ingredients_list:
+        logger.info(f"Separating {len(ingredients_list)} ingredients with AI intelligent matching")
+        
+        # Use AI to intelligently separate harmful vs safe (handles name variations automatically)
+        separated = await separate_ingredients_with_ai(ingredients_list, chemical_flags)
+        
+        harmful_ingredient_names = separated.get("harmful", [])
+        safe_ingredient_names = separated.get("safe", [])
+        
+        logger.info(f"AI separation complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+        
+        # Generate detailed descriptions using AI-separated lists
+        ingredient_descriptions = get_detailed_ingredient_descriptions(
+            safe_ingredients=safe_ingredient_names,
+            harmful_ingredients=harmful_ingredient_names,
+            harmful_chemicals_db=chemical_flags
+        )
+    else:
+        harmful_ingredient_names = []
+        safe_ingredient_names = []
+        ingredient_descriptions = {"safe": {}, "harmful": {}}
+    
+    # Analyze packaging materials with OpenAI web search fallback
     packaging_text = db_data.get('packaging', '') or vision_data.get('container_info', {}).get('material', '')
     packaging_tags = db_data.get('packaging_tags', [])
+    packaging_source = "database"
+    
+    # If no packaging info, try OpenAI web search
+    if not packaging_text and not packaging_tags:
+        product_name = db_data.get('product_name') or vision_data['product_name']
+        brand = db_data.get('brands') or vision_data['brand']
+        category = db_data.get('categories') or vision_data['category']
+        
+        logger.info(f"No packaging in database, searching with OpenAI web search: {brand} {product_name}")
+        packaging_text = await search_packaging_info(product_name, brand, category)
+        
+        if packaging_text:
+            packaging_source = "web_search"
+            logger.info(f"OpenAI web search found packaging: {packaging_text}")
     
     if packaging_text or packaging_tags:
         logger.info(f"Analyzing packaging materials: {packaging_text}")
@@ -251,15 +286,17 @@ def merge_database_and_vision(
         "product_type": vision_data.get('product_type', ''),
         "image_url": db_data.get('image_url', ''),
         "barcode": db_data.get('code', ''),
-        "ingredients": ingredients_text,
+        "ingredients": safe_ingredient_names,  # Only safe ingredients
+        "harmful_ingredients": harmful_ingredient_names,  # Only harmful ingredients
         "nutrition": db_data.get('nutrition', {}),
         "marketing_claims": vision_data.get('marketing_claims', []),
         "certifications_visible": vision_data.get('certifications_visible', []),
         "container_info": vision_data.get('container_info', {}),
-        "packaging": db_data.get('packaging', ''),
+        "packaging": packaging_text if packaging_source == "web_search" else db_data.get('packaging', ''),
         "quantity": db_data.get('quantity', '') or vision_data.get('container_info', {}).get('size', ''),
         "data_source": data_source,
         "confidence": confidence,
+        "packaging_source": packaging_source,
         "chemical_analysis": {
             "flags": [
                 {
@@ -342,13 +379,44 @@ async def ai_only_analysis(image_bytes: bytes, product_info: dict) -> dict:
     safety_score = calculate_safety_score(chemical_flags)
     recommendations = generate_recommendations(chemical_flags, category)
     
-    # Get ingredient descriptions
+    # Get ingredient descriptions with AI separation (ensures no duplicates between safe/harmful)
     ingredients_list = [ing.strip() for ing in ingredients_text.split(',')] if ingredients_text and ingredients_text != "Could not extract ingredients from image" else []
-    ingredient_descriptions = get_detailed_ingredient_descriptions(ingredients_list, chemical_flags)
     
-    # Analyze packaging materials
+    if ingredients_list:
+        logger.info(f"Separating {len(ingredients_list)} ingredients with AI intelligent matching")
+        
+        # Use AI to intelligently separate harmful vs safe (handles name variations automatically)
+        separated = await separate_ingredients_with_ai(ingredients_list, chemical_flags)
+        
+        harmful_ingredient_names = separated.get("harmful", [])
+        safe_ingredient_names = separated.get("safe", [])
+        
+        logger.info(f"AI separation complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+        
+        # Generate detailed descriptions using AI-separated lists
+        ingredient_descriptions = get_detailed_ingredient_descriptions(
+            safe_ingredients=safe_ingredient_names,
+            harmful_ingredients=harmful_ingredient_names,
+            harmful_chemicals_db=chemical_flags
+        )
+    else:
+        harmful_ingredient_names = []
+        safe_ingredient_names = []
+        ingredient_descriptions = {"safe": {}, "harmful": {}}
+    
+    # Analyze packaging materials with OpenAI web search fallback
     packaging_text = product_info.get('container_info', {}).get('material', '')
     packaging_tags = []
+    packaging_source = "ai_vision"
+    
+    # If no packaging info, try OpenAI web search
+    if not packaging_text:
+        logger.info(f"No packaging from vision, searching with OpenAI web search: {brand} {product_name}")
+        packaging_text = await search_packaging_info(product_name, brand, category)
+        
+        if packaging_text:
+            packaging_source = "web_search"
+            logger.info(f"OpenAI web search found packaging: {packaging_text}")
     
     if packaging_text:
         logger.info(f"Analyzing packaging materials: {packaging_text}")
@@ -368,12 +436,15 @@ async def ai_only_analysis(image_bytes: bytes, product_info: dict) -> dict:
         "brand": product_info.get('brand', ''),
         "category": product_info.get('category', ''),
         "product_type": product_info.get('product_type', ''),
-        "ingredients": ingredients_text,
+        "ingredients": safe_ingredient_names,  # Only safe ingredients
+        "harmful_ingredients": harmful_ingredient_names,  # Only harmful ingredients
         "marketing_claims": product_info.get('marketing_claims', []),
         "certifications_visible": product_info.get('certifications_visible', []),
         "container_info": product_info.get('container_info', {}),
+        "packaging": packaging_text if packaging_source == "web_search" else "",
         "data_source": data_source,
         "confidence": confidence,
+        "packaging_source": packaging_source,
         "chemical_analysis": {
             "flags": [
                 {
@@ -417,3 +488,88 @@ def get_chemical_explanation(category: str) -> str:
         "Sunscreen": "Chemical UV filter that may disrupt hormones and harm coral reefs",
     }
     return explanations.get(category, f"{category} chemical with potential health concerns")
+
+
+@router.post("/product/recommendations")
+async def get_product_recommendations(
+    product_name: str = Form(None),
+    brand: str = Form(None),
+    category: str = Form(None),
+    ingredients: str = Form(None),
+    marketing_claims: str = Form(None),
+    certifications: str = Form(None),
+    product_type: str = Form(None),
+    image: UploadFile = File(None)
+):
+    """
+    Get product recommendations for a photo-identified product.
+    Uses multimodal search (text + image) with ALL OCR-extracted data.
+    
+    Args:
+        product_name: Product name
+        brand: Brand name
+        category: Product category (optional)
+        ingredients: Comma-separated ingredients from OCR
+        marketing_claims: Marketing claims (e.g., "Organic, Non-GMO")
+        certifications: Visible certifications on packaging
+        product_type: Product type classification
+        image: The original scanned image (optional, for multimodal search)
+        
+    Returns:
+        {
+            "success": true,
+            "recommendations": {
+                "status": "success" | "partial" | "ai_fallback",
+                "products": [...],
+                "ai_alternatives": [...],
+                "message": "..."
+            }
+        }
+    """
+    try:
+        from routers.scan import get_product_recommendations_with_image
+        from PIL import Image
+        from io import BytesIO
+        
+        if not product_name:
+            return {
+                'success': False,
+                'recommendations': None,
+                'message': 'Product name is required'
+            }
+        
+        # If image is provided, read it for multimodal search
+        image_data = None
+        if image:
+            image_bytes = await image.read()
+            image_data = Image.open(BytesIO(image_bytes))
+            if image_data.mode != 'RGB':
+                image_data = image_data.convert('RGB')
+            logger.info(f"Using uploaded image for multimodal recommendations")
+        
+        # Get recommendations with rich OCR data
+        recommendations = await get_product_recommendations_with_image(
+            product_name=product_name,
+            brand=brand or '',
+            category=category or '',
+            ingredients=ingredients or '',
+            marketing_claims=marketing_claims or '',
+            certifications=certifications or '',
+            product_type=product_type or '',
+            image=image_data,
+            top_k=3,
+            min_score=0.4
+        )
+        
+        return {
+            'success': True,
+            'recommendations': recommendations,
+            'message': 'Recommendations generated successfully'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting product recommendations: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting recommendations: {str(e)}"
+        )

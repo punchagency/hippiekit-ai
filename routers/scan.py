@@ -293,6 +293,191 @@ async def get_smart_recommendations(
     }
 
 
+async def get_product_recommendations_with_image(
+    product_name: str,
+    brand: str = "",
+    category: str = "",
+    ingredients: str = "",
+    marketing_claims: str = "",
+    certifications: str = "",
+    product_type: str = "",
+    image = None,  # PIL Image object
+    top_k: int = 10,
+    min_score: float = 0.3
+) -> Dict[str, Any]:
+    """
+    Get product recommendations using multimodal search (text + image) with rich OCR data.
+    Combines text embedding (70%) with image embedding (30%) for better matching.
+    Uses ALL OCR-extracted data for semantic similarity matching.
+    
+    Args:
+        product_name: Product name
+        brand: Brand name (optional)
+        category: Product category (optional)
+        ingredients: Comma-separated ingredients text from OCR
+        marketing_claims: Marketing claims (e.g., "Organic, Non-GMO")
+        certifications: Certifications visible on package
+        product_type: Product type classification
+        image: PIL Image object of the scanned product (optional)
+        top_k: Number of candidates to retrieve
+        min_score: Minimum similarity score threshold
+        
+    Returns:
+        {
+            "status": "success" | "partial" | "ai_fallback",
+            "products": [...],
+            "ai_alternatives": [...],
+            "message": "..."
+        }
+    """
+    try:
+        clip_embedder = get_clip_embedder()
+        text_embedding = None
+        image_embedding = None
+        
+        # Step 1: Build rich text query from all available OCR data
+        text_parts = [product_name, brand, category, product_type]
+        
+        # Add marketing claims (strong semantic signals)
+        if marketing_claims:
+            text_parts.append(marketing_claims)
+        
+        # Add certifications (important for health-conscious matching)
+        if certifications:
+            text_parts.append(certifications)
+        
+        # Add first 10 ingredients to avoid token limits while preserving key composition info
+        if ingredients:
+            ingredient_list = [ing.strip() for ing in ingredients.split(',')[:10]]
+            text_parts.append(' '.join(ingredient_list))
+        
+        text_query = ' '.join([p for p in text_parts if p]).strip()
+        logger.info(f"Rich OCR text query ({len(text_query)} chars): {text_query[:200]}...")
+        logger.info(f"Generating text embedding for: {text_query}")
+        text_embedding = clip_embedder.model.encode(text_query, convert_to_numpy=True)
+        
+        # Step 2: Generate image embedding if image provided
+        if image is not None:
+            try:
+                logger.info("Generating image embedding from provided photo")
+                image_embedding = clip_embedder.embed_image(image)
+                logger.info("Successfully generated image embedding")
+            except Exception as img_error:
+                logger.warning(f"Failed to generate image embedding: {img_error}")
+                image_embedding = None
+        
+        # Step 3: Combine embeddings (weighted: 70% text, 30% image)
+        if text_embedding is not None and image_embedding is not None:
+            import numpy as np
+            combined_embedding = 0.7 * text_embedding + 0.3 * image_embedding
+            combined_embedding = combined_embedding / np.linalg.norm(combined_embedding)
+            embedding_method = "multimodal (70% text, 30% image)"
+        elif text_embedding is not None:
+            combined_embedding = text_embedding
+            embedding_method = "text_only"
+        else:
+            # Fallback to AI alternatives
+            logger.warning("No embeddings available, using AI fallback")
+            ai_alternatives = await generate_ai_product_alternatives(
+                product_name=product_name,
+                category=category,
+                count=3
+            )
+            return {
+                "status": "ai_fallback",
+                "products": [],
+                "ai_alternatives": ai_alternatives,
+                "message": "No embeddings available. Showing AI-recommended alternatives.",
+                "embedding_method": "none"
+            }
+        
+        # Step 4: Query Pinecone
+        pinecone_service = get_pinecone_service()
+        candidates = pinecone_service.query_similar_products(
+            query_embedding=combined_embedding,
+            top_k=top_k,
+            min_score=min_score
+        )
+        
+        logger.info(f"Pinecone returned {len(candidates)} candidate products (method: {embedding_method})")
+        
+        if not candidates:
+            ai_alternatives = await generate_ai_product_alternatives(
+                product_name=product_name,
+                category=category,
+                count=3
+            )
+            return {
+                "status": "ai_fallback",
+                "products": [],
+                "ai_alternatives": ai_alternatives,
+                "message": "No similar products found. Showing AI-recommended alternatives.",
+                "embedding_method": embedding_method
+            }
+        
+        # Step 5: AI-powered relevance filtering
+        relevant_products = await filter_relevant_products(
+            scanned_product_name=product_name,
+            scanned_category=category,
+            candidate_products=candidates,
+            min_relevance_score=7
+        )
+        
+        logger.info(f"AI filtered to {len(relevant_products)} relevant products from {len(candidates)} candidates")
+        
+        # Step 6: Decide on final response
+        if len(relevant_products) >= 2:
+            return {
+                "status": "success",
+                "products": relevant_products[:3],
+                "ai_alternatives": [],
+                "message": f"Found {len(relevant_products)} relevant products from Hippiekit database",
+                "embedding_method": embedding_method
+            }
+        elif len(relevant_products) == 1:
+            ai_alternatives = await generate_ai_product_alternatives(
+                product_name=product_name,
+                category=category,
+                count=2
+            )
+            return {
+                "status": "partial",
+                "products": relevant_products,
+                "ai_alternatives": ai_alternatives,
+                "message": f"Found {len(relevant_products)} relevant product. Supplemented with AI alternatives.",
+                "embedding_method": embedding_method
+            }
+        else:
+            ai_alternatives = await generate_ai_product_alternatives(
+                product_name=product_name,
+                category=category,
+                count=3
+            )
+            return {
+                "status": "ai_fallback",
+                "products": [],
+                "ai_alternatives": ai_alternatives,
+                "message": "No relevant matches found. Showing AI-recommended alternatives.",
+                "embedding_method": embedding_method
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in get_product_recommendations_with_image: {e}", exc_info=True)
+        # Return AI fallback on error
+        ai_alternatives = await generate_ai_product_alternatives(
+            product_name=product_name,
+            category=category,
+            count=3
+        )
+        return {
+            "status": "ai_fallback",
+            "products": [],
+            "ai_alternatives": ai_alternatives,
+            "message": f"Error during search: {str(e)}. Showing AI alternatives.",
+            "embedding_method": "error"
+        }
+
+
 async def get_product_recommendations_for_barcode(
     product_data: Dict[str, Any],
     top_k: int = 10,  # Query more to allow filtering
@@ -966,30 +1151,27 @@ Output must be valid JSON only. Always use the exact chemical names provided as 
                 ingredients_str = ", ".join(safe_ingredients)
                 logger.info(f"Generating descriptions for {len(safe_ingredients)} safe ingredients")
                 
-                safe_prompt = f"""Analyze these ingredients from a whole-food, natural nutrition perspective.
+                safe_prompt = f"""Analyze these safe/common ingredients found in a consumer product from a whole-food nutrition perspective.
 
-INGREDIENTS TO ANALYZE:
+INGREDIENTS TO DESCRIBE:
 {ingredients_str}
 
-For each ingredient, provide a description that:
-1. States whether it's whole-food, minimally processed, ultra-processed, or synthetic
-2. Explains its purpose/function in the product
-3. Calls out if it's industrially processed, refined, or lab-derived
-4. Notes any nutritional value or concerns from a hippie/natural perspective
+For each ingredient, provide a brief, educational description (1-2 sentences) that:
+1. Explains what the ingredient is (whole food vs processed vs synthetic)
+2. States its primary purpose/function in the product
+3. Offers a grounded nutritional perspective (is it beneficial, neutral, or concerning?)
+4. Mentions any processing concerns if it's refined/industrial
 
-CRITICAL RULES:
-• If an ingredient is refined sugar, industrial syrup, or highly processed - call it out
-• "Flavourings", "Modified Starch", "Maltodextrin" = ultra-processed red flags
-• If it has a long chemical name or E-number, assume synthetic/industrial
-• Palm oil/fat = environmental concern (deforestation)
-• Glucose syrup = refined sugar (blood sugar spike concern)
-• If an ingredient can be natural OR synthetic, assume synthetic unless label says otherwise
-• Whole foods (fruits, vegetables, whole grains) get positive descriptions
-• Industrial ingredients get honest critiques
+Guidelines:
+• Be honest about ultra-processed ingredients (refined sugar, modified starches, industrial oils)
+• Don't give processed foods a free pass just because they're "safe"
+• Whole foods get positive descriptions, ultra-processed get honest critique
+• Keep it educational, not alarmist
 
 Tone: Educational, honest, grounded in whole-food philosophy. Not alarmist, but don't sugarcoat industrial processing.
 
-Format as JSON: {{"Ingredient Name Exactly As Listed": "honest description"}}
+Return ONLY valid JSON with ingredient names as keys and simple string descriptions as values:
+{{"Ingredient Name": "Brief 1-2 sentence description"}}
 
 Ingredients: {ingredients_str}"""
                 
@@ -998,29 +1180,17 @@ Ingredients: {ingredients_str}"""
                     messages=[
                         {
                             "role": "system", 
-                            "content": """You are a strict, whole-foods-focused nutritionist analyzing ingredients with a hippie, natural-living philosophy.
+                            "content": """You are a nutritionist analyzing ingredients with a whole-foods philosophy.
 
 Your perspective:
 • Whole, unprocessed foods = good
-• Refined, industrial, synthetic ingredients = problematic
+• Refined, industrial, synthetic ingredients = problematic but honest
 • Ultra-processed ingredients deserve honest critique
-• You do NOT give ultra-processed foods a free pass
-• Sugar is sugar - refined industrial sweeteners are blood sugar bombs
-• "Flavourings" = hidden synthetic chemicals until proven otherwise
-• Modified starches, maltodextrins, syrups = industrial food engineering
+• Sugar is sugar - refined industrial sweeteners are concerning
 • If something can be natural or synthetic, assume synthetic unless stated
 
-You are NOT anti-food or fear-mongering. You are pro-real-food and anti-industrial-processing.
-
-Classification framework:
-• Whole food: recognizable plant/animal food (apple, chicken, rice)
-• Minimally processed: extracted but still recognizable (olive oil, whole wheat flour)
-• Ultra-processed: industrial transformation (maltodextrin, modified starch, glucose syrup)
-• Synthetic: lab-created (artificial flavors, dyes, preservatives)
-
-Tone: Educational, grounded, honest. Like a nutritionist who shops at farmers markets.
-
-Output must be valid JSON only. Always use exact ingredient names as keys."""
+Output ONLY valid JSON with ingredient names as keys and simple string descriptions as values.
+Example: {"Sugar": "Refined white sugar is an ultra-processed sweetener that spikes blood sugar."}"""
                         },
                         {"role": "user", "content": safe_prompt}
                     ],
