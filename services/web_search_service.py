@@ -6,7 +6,8 @@ Uses multiple sources to find product ingredients when database is empty
 import os
 import re
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from urllib.parse import quote
 import httpx
 from openai import OpenAI
 
@@ -272,6 +273,170 @@ If you don't have information about this specific product, respond with only: UN
             'confidence': 'low',
             'note': f'Generic {category or "product"} ingredients provided. For accurate analysis, please take a photo of the ingredient label or search for this specific product online.'
         }
+    
+    async def fetch_brand_logo(self, brand_name: str, product_type: str = "") -> Optional[str]:
+        """
+        Fetch brand logo image URL using Brandfetch Logo API CDN.
+        
+        Args:
+            brand_name: The brand name to search for
+            product_type: Optional product type context (not used)
+            
+        Returns:
+            Direct CDN URL to the brand logo or None if brand not found
+        """
+        try:
+            logger.info(f"[BRANDFETCH] Searching for logo: {brand_name}")
+            
+            # Step 1: Search for brand to get the correct domain
+            # URL-encode the brand name to handle special characters (e.g., LÄRABAR)
+            encoded_brand_name = quote(brand_name, safe='')
+            search_url = f"https://api.brandfetch.io/v2/search/{encoded_brand_name}"
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # Search for brand (no API key needed for search)
+                search_response = await client.get(search_url)
+                
+                if search_response.status_code != 200:
+                    logger.warning(f"[BRANDFETCH] Search failed for {brand_name}: {search_response.status_code}")
+                    return None
+                
+                search_results = search_response.json()
+                
+                if not search_results or len(search_results) == 0:
+                    logger.warning(f"[BRANDFETCH] No brands found for {brand_name}")
+                    return None
+                
+                # Step 2: Find the best matching brand
+                brand_domain = self._find_best_brand_match(brand_name, search_results)
+                
+                if not brand_domain:
+                    logger.warning(f"[BRANDFETCH] No domain found for {brand_name}")
+                    return None
+                
+                logger.info(f"[BRANDFETCH] Found domain: {brand_domain}")
+                
+                # Step 3: Construct Logo API CDN URL
+                # Format: https://cdn.brandfetch.io/:domain/icon.png
+                # Using icon type (square logo) in PNG format for best compatibility
+                # Note: For production, get a free Client ID from https://developers.brandfetch.com/register
+                # and add it as ?c=YOUR_CLIENT_ID
+                
+                # Try different logo formats
+                logo_urls = [
+                    f"https://cdn.brandfetch.io/{brand_domain}/icon.png",  # Square icon PNG
+                    f"https://cdn.brandfetch.io/{brand_domain}/logo.png",  # Horizontal logo PNG
+                    f"https://cdn.brandfetch.io/{brand_domain}",           # Default (WebP)
+                ]
+                
+                # Verify which logo URL is accessible
+                for logo_url in logo_urls:
+                    try:
+                        # Quick HEAD request to check if logo exists
+                        head_response = await client.head(logo_url, timeout=3.0)
+                        
+                        if head_response.status_code == 200:
+                            logger.info(f"[BRANDFETCH] ✓ Found logo for {brand_name}: {logo_url}")
+                            return logo_url
+                    except:
+                        continue
+                
+                # If no logo accessible, return the default icon URL anyway
+                # (Brandfetch will show a fallback if logo doesn't exist)
+                default_url = f"https://cdn.brandfetch.io/{brand_domain}/icon.png"
+                logger.info(f"[BRANDFETCH] Using default logo URL for {brand_name}: {default_url}")
+                return default_url
+            
+        except httpx.TimeoutException:
+            logger.error(f"[BRANDFETCH] Timeout searching for {brand_name} logo")
+            return None
+        except Exception as e:
+            logger.error(f"[BRANDFETCH] Error fetching logo for {brand_name}: {str(e)}")
+            return None
+    
+    def _find_best_brand_match(self, search_term: str, results: list[Dict]) -> Optional[str]:
+        """
+        Find the best matching brand from search results.
+        
+        Prioritizes:
+        1. Exact domain match (rxbar → rxbar.com)
+        2. Verified/claimed brands
+        3. Name similarity
+        4. Quality score
+        
+        Args:
+            search_term: The original brand name searched
+            results: List of brand search results from Brandfetch
+            
+        Returns:
+            Best matching domain or None
+        """
+        if not results:
+            return None
+        
+        # Normalize search term for comparison
+        search_normalized = search_term.lower().replace(' ', '').replace("'", '').replace('&', '')
+        
+        # Score each result
+        best_match = None
+        best_score = -1
+        
+        for result in results:
+            domain = result.get('domain', '')
+            name = result.get('name') or ''
+            verified = result.get('verified', False)
+            claimed = result.get('claimed', False)
+            quality_score = result.get('qualityScore', 0)
+            
+            # Extract base domain (remove .com, .co, etc.)
+            domain_base = domain.split('.')[0].lower()
+            name_normalized = name.lower().replace(' ', '').replace("'", '').replace('&', '')
+            
+            # Calculate match score
+            score = 0
+            
+            # 1. Exact domain match (highest priority)
+            if domain_base == search_normalized:
+                score += 100
+                logger.debug(f"[BRANDFETCH] Exact domain match: {domain}")
+            
+            # 2. Exact name match
+            if name_normalized == search_normalized:
+                score += 90
+                logger.debug(f"[BRANDFETCH] Exact name match: {name}")
+            
+            # 3. Domain contains search term
+            if search_normalized in domain_base:
+                score += 50
+                logger.debug(f"[BRANDFETCH] Domain contains term: {domain}")
+            
+            # 4. Search term contains domain (for acronyms)
+            if domain_base in search_normalized:
+                score += 40
+            
+            # 5. Name contains search term
+            if search_normalized in name_normalized:
+                score += 30
+            
+            # 6. Verified/claimed bonus
+            if verified:
+                score += 20
+            if claimed:
+                score += 15
+            
+            # 7. Quality score bonus (0-10 points)
+            score += quality_score * 10
+            
+            logger.debug(f"[BRANDFETCH] {domain} ({name}) - Score: {score}")
+            
+            if score > best_score:
+                best_score = score
+                best_match = domain
+        
+        if best_match:
+            logger.info(f"[BRANDFETCH] Best match: {best_match} (score: {best_score})")
+        
+        return best_match
 
 
 # Global instance

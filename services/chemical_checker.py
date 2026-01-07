@@ -266,6 +266,15 @@ def build_search_patterns() -> Dict[str, Dict]:
 # Build search patterns once at module load
 SEARCH_PATTERNS = build_search_patterns()
 
+# Pre-compile regex patterns for better performance
+COMPILED_PATTERNS = {}
+for pattern in SEARCH_PATTERNS.keys():
+    COMPILED_PATTERNS[pattern] = {
+        "standard": re.compile(r'\b' + re.escape(pattern) + r's?\b'),
+        "parentheses": re.compile(r'\(' + re.escape(pattern) + r's?\)'),
+        "hyphen_slash": re.compile(r'[-/]' + re.escape(pattern) + r's?\b')
+    }
+
 
 def check_ingredients(ingredient_text: str) -> List[Dict[str, Any]]:
     """
@@ -289,23 +298,13 @@ def check_ingredients(ingredient_text: str) -> List[Dict[str, Any]]:
     
     # Search for each pattern
     for pattern, chem_info in SEARCH_PATTERNS.items():
-        # Use word boundary matching to avoid partial matches
-        # e.g., "paraben" shouldn't match "paraben-free"
-        # Enhanced: Also check for patterns in parentheses and with optional 's' for plurals
+        # Use pre-compiled regex patterns for better performance
+        compiled = COMPILED_PATTERNS[pattern]
         
-        # Pattern 1: Standard word boundary match with optional plural
-        regex1 = r'\b' + re.escape(pattern) + r's?\b'
-        
-        # Pattern 2: Inside parentheses (e.g., "Tartrazine (E102)")
-        regex2 = r'\(' + re.escape(pattern) + r's?\)'
-        
-        # Pattern 3: After hyphen or slash (e.g., "color-e102" or "dye/e129")
-        regex3 = r'[-/]' + re.escape(pattern) + r's?\b'
-        
-        # Check all patterns
-        if (re.search(regex1, text_lower) or 
-            re.search(regex2, text_lower) or 
-            re.search(regex3, text_lower)):
+        # Check all patterns using pre-compiled regex
+        if (compiled["standard"].search(text_lower) or 
+            compiled["parentheses"].search(text_lower) or 
+            compiled["hyphen_slash"].search(text_lower)):
             
             chem_name = chem_info["name"]
             

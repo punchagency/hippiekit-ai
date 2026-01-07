@@ -5,10 +5,13 @@ Includes web search fallback for products with empty ingredient data
 """
 
 import requests
+import asyncio
+import aiohttp
 from typing import Optional, Dict, Any, List
 import logging
 from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations
 from services.web_search_service import web_search_service
+from services.cache_service import cache_service
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +27,12 @@ class BarcodeService:
     def __init__(self):
         self.timeout = 10  # seconds
         self.web_search = web_search_service
+        self.cache = cache_service
         
     async def lookup_barcode(self, barcode: str) -> Optional[Dict[str, Any]]:
         """
         Look up a product by barcode across all Open*Facts databases.
-        Tries each database in order until a product is found.
+        Checks cache first, then queries all databases in parallel if not cached.
         If found but ingredients are empty, attempts web search fallback.
         
         Args:
@@ -37,29 +41,89 @@ class BarcodeService:
         Returns:
             Normalized product data or None if not found
         """
-        # Try each database in order
+        # Check cache first
+        cached_result = await self.cache.get_barcode(barcode)
+        if cached_result:
+            logger.info(f"Returning cached result for barcode: {barcode}")
+            return cached_result
+        
+        # Cache miss - query databases
+        result = await self._fetch_from_databases(barcode)
+        
+        # Cache the result if found
+        if result:
+            await self.cache.set_barcode(barcode, result)
+        
+        return result
+    
+    async def _fetch_from_databases(self, barcode: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch product data from Open*Facts databases in parallel
+        
+        Args:
+            barcode: Product barcode
+            
+        Returns:
+            Normalized product data or None if not found
+        """
+        # Database configurations
         databases = [
-            ("OpenFoodFacts", self.OPENFOODFACTS_API),
-            ("OpenBeautyFacts", self.OPENBEAUTYFACTS_API),
-            ("OpenProductsFacts", self.OPENPRODUCTSFACTS_API),  # Updated reference
+            ("OpenFoodFacts", self.OPENFOODFACTS_API.format(barcode=barcode)),
+            ("OpenBeautyFacts", self.OPENBEAUTYFACTS_API.format(barcode=barcode)),
+            ("OpenProductsFacts", self.OPENPRODUCTSFACTS_API.format(barcode=barcode)),
         ]
         
-        for db_name, api_url in databases:
+        # Create parallel tasks for all databases
+        tasks = [
+            self._query_api_async(url, db_name) 
+            for db_name, url in databases
+        ]
+        
+        # Wait for first successful result
+        for task in asyncio.as_completed(tasks):
             try:
-                logger.info(f"Querying {db_name} for barcode: {barcode}")
-                product_data = self._query_api(api_url.format(barcode=barcode))
-                
+                db_name, product_data = await task
                 if product_data:
                     logger.info(f"Product found in {db_name}")
                     normalized = await self._normalize_product_data(product_data, db_name)
                     return normalized
-                    
             except Exception as e:
-                logger.warning(f"Error querying {db_name}: {str(e)}")
+                logger.warning(f"Error in parallel query: {str(e)}")
                 continue
         
         logger.info(f"Product not found in any database for barcode: {barcode}")
         return None
+    
+    async def _query_api_async(self, url: str, db_name: str) -> tuple[str, Optional[Dict[str, Any]]]:
+        """
+        Async query to an Open*Facts API endpoint
+        
+        Args:
+            url: Full API URL with barcode
+            db_name: Name of the database being queried
+            
+        Returns:
+            Tuple of (db_name, product_data) or (db_name, None) if not found
+        """
+        try:
+            logger.info(f"Querying {db_name}")
+            headers = {
+                "User-Agent": "Hippiekit - Product Scanner App - Contact: support@hippiekit.com"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=self.timeout)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        # Check if product was found
+                        if data.get("status") == 1 and data.get("product"):
+                            return (db_name, data["product"])
+            
+            return (db_name, None)
+            
+        except Exception as e:
+            logger.error(f"{db_name} API request failed: {str(e)}")
+            return (db_name, None)
     
     def _query_api(self, url: str) -> Optional[Dict[str, Any]]:
         """

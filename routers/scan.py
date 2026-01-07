@@ -1,4 +1,5 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
 from PIL import Image
 import io
 from typing import List, Dict, Any, Optional
@@ -11,6 +12,7 @@ import re
 import numpy as np
 import requests
 from io import BytesIO
+import asyncio
 
 from models import get_clip_embedder
 from services import get_pinecone_service
@@ -25,6 +27,7 @@ router = APIRouter()
 class BarcodeLookupRequest(BaseModel):
     """Request model for barcode lookup"""
     barcode: str
+    product_data: Optional[Dict[str, Any]] = None  # Optional pre-fetched product data to avoid redundant API calls
 
 
 def normalize_ingredient_text(text: str) -> str:
@@ -94,7 +97,7 @@ async def infer_ingredients_from_context(
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
-        prompt = f"""Based on this product information, provide an educated analysis of likely ingredients and packaging.
+        prompt = f"""Based on this product information, provide an educated Fsis of likely ingredients and packaging.
 
 Product: {product_name}
 Brand: {brand or 'Unknown'}
@@ -790,7 +793,8 @@ async def generate_ai_product_alternatives(
                 "name": "Product Name",
                 "brand": "Brand Name",
                 "description": "Why this is a healthier alternative",
-                "type": "ai_generated"
+                "type": "ai_generated",
+                "logo_url": "URL to brand logo image (optional)"
             }
         ]
     """
@@ -858,11 +862,26 @@ Now generate {count} alternatives for "{product_name}" (category: {category}):""
         
         alternatives = json.loads(content)
         
-        # Add type marker
+        # Add type marker and fetch brand logos
+        from services.web_search_service import web_search_service
+        
         for alt in alternatives:
             alt["type"] = "ai_generated"
+            
+            # Fetch brand logo asynchronously
+            brand_name = alt.get("brand", "")
+            if brand_name:
+                try:
+                    logo_url = await web_search_service.fetch_brand_logo(brand_name, category)
+                    if logo_url:
+                        alt["logo_url"] = logo_url
+                        logger.info(f"[LOGO] Found logo for {brand_name}: {logo_url}")
+                    else:
+                        logger.warning(f"[LOGO] No logo found for {brand_name}")
+                except Exception as e:
+                    logger.error(f"[LOGO] Error fetching logo for {brand_name}: {e}")
         
-        logger.info(f"Generated {len(alternatives)} AI product alternatives")
+        logger.info(f"Generated {len(alternatives)} AI product alternatives with logos")
         return alternatives
         
     except Exception as e:
@@ -936,6 +955,36 @@ def parse_nested_ingredients(ingredients_text: str) -> List[str]:
     return unique_ingredients
 
 
+# Hard guardrail keywords - ingredients containing these are ALWAYS flagged as harmful
+AUTO_HARMFUL_KEYWORDS = [
+    # Added sugars
+    "sugar", "syrup", "dextrose", "glucose", "fructose", "maltodextrin",
+    "sucralose", "aspartame", "saccharin", "acesulfame",
+    
+    # Fillers / modified
+    "modified", "starch", "hydrolyzed",
+    
+    # Flavorings
+    "flavor", "flavour", "flavoring", "flavouring",
+    
+    # Dyes / colorants (E-numbers)
+    "color", "colour", "e1", "e2", "e3", "e4", "e5",
+    "red 40", "yellow 5", "yellow 6", "blue 1", "blue 2",
+    
+    # Preservatives
+    "preservative", "benzoate", "sorbate", "nitrite", "nitrate",
+    "bht", "bha", "tbhq",
+    
+    # Oils (refined/processed)
+    "canola oil", "vegetable oil", "palm oil", "soybean oil",
+    "partially hydrogenated", "hydrogenated",
+    
+    # Emulsifiers/stabilizers
+    "polysorbate", "carrageenan", "xanthan", "guar gum",
+    "mono and diglycerides", "lecithin"
+]
+
+
 async def separate_ingredients_with_ai(
     ingredients_list: List[str],
     harmful_chemicals_db: List[Dict[str, Any]]
@@ -961,41 +1010,71 @@ async def separate_ingredients_with_ai(
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
+        # STEP 1: Pre-flag obvious harmful ingredients (confidence guardrail)
+        pre_flagged_harmful = [
+            ing for ing in ingredients_list
+            if any(keyword in ing.lower() for keyword in AUTO_HARMFUL_KEYWORDS)
+        ]
+        
+        logger.info(f"Pre-flagged {len(pre_flagged_harmful)} ingredients as harmful based on keywords")
+        
         # Extract chemical names from database as REFERENCE (not for matching)
         harmful_chemical_names = [chem['chemical'] for chem in harmful_chemicals_db]
         
-        # Create prompt for AI categorization
-        prompt = f"""You are a food safety expert analyzing product ingredients.
+        # STEP 2: Create prompt for AI categorization with guardrail enforcement
+        prompt = f"""
+            You are a STRICT whole-food ingredient reviewer similar to the Bobby Approved app.
 
-INGREDIENTS TO ANALYZE:
-{', '.join(ingredients_list)}
+            INGREDIENT LIST (EXACT TEXT):
+            {', '.join(ingredients_list)}
 
-HARMFUL CHEMICALS DATABASE (REFERENCE ONLY):
-{', '.join(harmful_chemical_names[:150])}
+            PRE-FLAGGED HARMFUL INGREDIENTS (NON-NEGOTIABLE):
+            {', '.join(pre_flagged_harmful) if pre_flagged_harmful else 'None'}
 
-TASK:
-Categorize each ingredient as HARMFUL or SAFE using:
-1. The chemical database as a reference (if ingredient is listed → harmful)
-2. Your own nutritional and chemical knowledge
+            CRITICAL RULE:
+            - Any ingredient listed in PRE-FLAGGED HARMFUL INGREDIENTS above MUST be classified as HARMFUL
+            - You are NOT allowed to move them to SAFE under any circumstances
+            - These are non-negotiable based on whole-food principles
 
-CRITICAL RULES:
-- DO NOT try to match aliases or variations
-- Use your AI knowledge to identify harmful ingredients even if not in database
-- Synthetic dyes (Red 40, Yellow 5, Blue 1, etc.) → harmful
-- Ultra-processed additives (maltodextrin, modified starch, HFCS) → harmful  
-- Artificial preservatives, flavors → harmful
-- Whole food ingredients (sugar, salt, water, wheat, etc.) → safe (even if processed)
-- Return ingredient names EXACTLY as they appear in the product ingredient list
-- Each ingredient appears in ONLY ONE list (either harmful OR safe, never both)
+            CORE PHILOSOPHY:
+            - If an ingredient is NOT clearly a whole, natural, minimally processed food → FLAG IT
+            - When in doubt → FLAG IT
+            - Added sugar IS considered harmful
+            - “Natural flavor”, “flavourings”, or vague terms → harmful
+            - E-numbers, dyes, preservatives → harmful
+            - Industrial or lab-modified ingredients → harmful
 
-Output ONLY valid JSON:
-{{
-    "harmful": ["Ingredient names from product"],
-    "safe": ["Ingredient names from product"]
-}}"""
+            DEFINITION:
+            HARMFUL means:
+            - Synthetic or artificial
+            - Ultra-processed
+            - Chemically modified
+            - Added sugars
+            - Fillers, stabilizers, colorants, preservatives
+            - Anything a human would not normally cook with at home
+
+            SAFE means:
+            - Single-ingredient whole foods
+            - Minimally processed
+            - Traditionally used in home cooking
+
+            RULES:
+            - Return ingredient names EXACTLY as written
+            - Each ingredient MUST appear in only ONE list
+            - Do NOT explain
+            - Do NOT add extra text
+            - Output ONLY valid JSON
+
+            JSON FORMAT:
+            {{
+            "harmful": [],
+            "safe": []
+            }}
+            """
+
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1",
             messages=[
                 {"role": "system", "content": "You are an expert at matching ingredient names against chemical databases, understanding name variations and aliases."},
                 {"role": "user", "content": prompt}
@@ -1012,7 +1091,18 @@ Output ONLY valid JSON:
             content = content.split("```")[1].split("```")[0].strip()
         
         result = json.loads(content)
-        logger.info(f"AI separated ingredients: {len(result.get('harmful', []))} harmful, {len(result.get('safe', []))} safe")
+        
+        # STEP 3: Post-AI Safety Check - Enforce guardrail after AI response
+        # This ensures pre-flagged ingredients are ALWAYS in harmful, even if AI made a mistake
+        result["harmful"] = list(set(result.get("harmful", []) + pre_flagged_harmful))
+        
+        # Remove any pre-flagged ingredients from safe list (prevents duplicates)
+        result["safe"] = [
+            ing for ing in result.get("safe", [])
+            if ing not in result["harmful"]
+        ]
+        
+        logger.info(f"AI separated ingredients: {len(result.get('harmful', []))} harmful, {len(result.get('safe', []))} safe (after guardrail enforcement)")
         
         return result
         
@@ -1057,12 +1147,12 @@ def get_detailed_ingredient_descriptions(
                     # Try to find this ingredient in the database for context
                     db_info = None
                     for chem in harmful_chemicals_db:
-                        if chem['chemical'].lower() == ing_name.lower():
+                        if chem.get('name', '').lower() == ing_name.lower():
                             db_info = chem
                             break
                     
                     if db_info:
-                        harmful_items.append(f"{ing_name} (Category: {db_info['category']}, Severity: {db_info['severity']})")
+                        harmful_items.append(f"{ing_name} (Category: {db_info.get('category', 'unknown')})")
                     else:
                         harmful_items.append(f"{ing_name} (AI flagged as harmful)")
                 
@@ -1138,8 +1228,8 @@ Output must be valid JSON only. Always use the exact chemical names provided as 
             except Exception as e:
                 logger.error(f"Failed to generate harmful chemical descriptions: {e}", exc_info=True)
                 # Fallback to basic descriptions
-                for chem in harmful_chemicals:
-                    harmful_descriptions[chem['chemical']] = f"This chemical has been flagged as {chem['severity'].lower()} concern due to its {chem['category'].lower()} properties. It may pose health and environmental risks."
+                for ing_name in harmful_ingredients:
+                    harmful_descriptions[ing_name] = f"This ingredient has been flagged as potentially harmful. It may be synthetic, ultra-processed, or pose health and environmental risks."
         
         # Generate safe ingredient descriptions with strict whole-food perspective
         safe_descriptions = {}
@@ -1332,20 +1422,48 @@ IMPORTANT: The material names in the "materials" array MUST EXACTLY MATCH the ke
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are an environmental scientist and toxicologist expert in packaging materials, plastic pollution, and consumer product safety."},
+                {"role": "system", "content": "You are an environmental scientist and toxicologist expert in packaging materials, plastic pollution, and consumer product safety. Always return valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_tokens=1000
+            max_tokens=1500,  # Increased token limit to avoid truncation
+            response_format={"type": "json_object"}  # Force JSON mode
         )
         
         content = response.choices[0].message.content.strip()
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
         
-        packaging_analysis = json.loads(content)
+        # Try to parse JSON directly first
+        try:
+            packaging_analysis = json.loads(content)
+        except json.JSONDecodeError:
+            # If direct parsing fails, try extracting from code blocks
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            # Try parsing again
+            try:
+                packaging_analysis = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse packaging analysis JSON: {e}")
+                logger.error(f"Raw response: {content[:500]}...")
+                # Return fallback
+                return {
+                    "materials": ["unknown"],
+                    "analysis": {
+                        "unknown": {
+                            "description": "Unable to analyze packaging materials",
+                            "harmful": False,
+                            "health_concerns": "Unknown",
+                            "environmental_impact": "Unknown",
+                            "severity": "low"
+                        }
+                    },
+                    "overall_safety": "unknown",
+                    "summary": "Unable to analyze packaging materials at this time."
+                }
+        
         logger.info(f"Generated packaging analysis for {len(packaging_analysis.get('materials', []))} materials")
         
         return packaging_analysis
@@ -1535,48 +1653,44 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
         
         logger.info(f"Parsed {len(ingredients_list)} ingredients from text")
         
-        # Check ingredients for harmful chemicals using NORMALIZED text
-        # Note: check_ingredients expects a string, not a list
-        harmful_chemicals = []
-        if normalized_ingredients_text:
-            try:
-                # Use normalized text for better chemical detection
-                harmful_chemicals = check_ingredients(normalized_ingredients_text)
-                logger.info(f"Found {len(harmful_chemicals)} harmful chemicals")
-            except Exception as e:
-                logger.error(f"Error checking ingredients: {e}")
-                # Continue without chemical analysis rather than failing
+        # === USE AI-ONLY SEPARATION (NO PATTERN MATCHING) ===
+        # Directly use AI to separate ingredients into harmful vs safe
+        harmful_ingredient_names = []
+        safe_ingredient_names = []
         
-        # Calculate safety score
-        safety_score = calculate_safety_score(harmful_chemicals)
-        
-        # === SMART RECOMMENDATIONS WITH PINECONE ===
-        recommendations = await get_smart_recommendations(
-            product_name=product_data.get("name", "Unknown"),
-            brand=product_data.get("brands", ""),
-            harmful_chemicals=harmful_chemicals,
-            category=product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General"
-        )
-        
-        # Build chemical analysis
-        product_data["chemical_analysis"] = {
-            "harmful_chemicals": harmful_chemicals,
-            "safety_score": safety_score,
-            "recommendations": recommendations
-        }
-        
-        # Generate detailed AI ingredient descriptions (safe + harmful)
         if ingredients_list:
             logger.info(f"Separating {len(ingredients_list)} ingredients with AI intelligent matching")
             
-            # Use AI to intelligently separate harmful vs safe (handles name variations automatically)
-            separated = await separate_ingredients_with_ai(ingredients_list, harmful_chemicals)
+            # Use AI to intelligently separate harmful vs safe (no pre-filtering with patterns)
+            separated = await separate_ingredients_with_ai(ingredients_list, [])  # Empty list - let AI decide everything
             
             harmful_ingredient_names = separated.get("harmful", [])
             safe_ingredient_names = separated.get("safe", [])
             
             logger.info(f"AI separation complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
-            
+        
+        # Build harmful chemicals list from AI separation
+        # No need for safety score calculation - not used in frontend
+        harmful_chemicals = [
+            {
+                "name": name, 
+                "type": "additive",
+                "category": "additive",  # Generic category for AI-identified ingredients
+            } 
+            for name in harmful_ingredient_names
+        ]
+        
+        # No recommendations needed here - they're fetched separately via /barcode/recommendations endpoint
+        # This saves processing time on the main barcode lookup
+        
+        # Build chemical analysis (simplified - no safety score)
+        product_data["chemical_analysis"] = {
+            "harmful_chemicals": harmful_chemicals,
+            "harmful_count": len(harmful_chemicals),
+        }
+        
+        # Generate detailed AI ingredient descriptions (safe + harmful)
+        if ingredients_list:
             # Generate detailed descriptions using AI-separated lists
             ingredient_descriptions = get_detailed_ingredient_descriptions(
                 safe_ingredients=safe_ingredient_names,
@@ -1691,7 +1805,6 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
         product_data["analysis_metadata"] = {
             "ingredients_source": ingredients_source,
             "packaging_source": packaging_source,
-            "recommendations_source": recommendations.get("source", "rule_based"),
             "confidence_level": confidence_level,
             "data_quality_score": max(0, data_quality_score),
             "inference_used": inference_used,
@@ -1712,6 +1825,813 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
         raise
     except Exception as e:
         logger.error(f"Error during barcode lookup: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error looking up barcode: {str(e)}"
+        )
+
+
+@router.get("/barcode/lookup")
+async def barcode_lookup(barcode: str) -> Dict[str, Any]:
+    """
+    FAST: Get basic product info from OpenFacts with parsed ingredients.
+    This is the first endpoint to call - returns in 1-2 seconds.
+    
+    Args:
+        barcode: Product barcode (UPC/EAN)
+        
+    Returns:
+        Basic product data with parsed ingredients list
+    """
+    try:
+        barcode = barcode.strip()
+        
+        # Validate barcode
+        if not barcode:
+            raise HTTPException(status_code=400, detail="Barcode cannot be empty")
+        
+        if not barcode.isdigit():
+            raise HTTPException(status_code=400, detail="Barcode must contain only digits")
+        
+        logger.info(f"[FAST] Looking up barcode: {barcode}")
+        
+        # Query barcode service (with caching)
+        barcode_service = get_barcode_service()
+        product_data = await barcode_service.lookup_barcode(barcode)
+        
+        if not product_data:
+            return {
+                'success': True,
+                'found': False,
+                'product': None,
+                'message': 'Product not found in database'
+            }
+        
+        # Extract and parse ingredients
+        ingredients_text = product_data.get("ingredients_text", "")
+        
+        # If ingredients_text is empty, try to extract from ingredients array
+        if not ingredients_text and "ingredients" in product_data:
+            ingredients_array = product_data["ingredients"]
+            for ing in ingredients_array:
+                if isinstance(ing, dict) and ing.get("type") == "full_text":
+                    ingredients_text = ing.get("text", "")
+                    break
+            
+            if not ingredients_text:
+                ingredient_texts = []
+                for ing in ingredients_array:
+                    if isinstance(ing, dict) and ing.get("type") == "structured":
+                        text = ing.get("text") or ing.get("id", "").replace("en:", "").replace("-", " ")
+                        if text:
+                            ingredient_texts.append(text)
+                ingredients_text = ", ".join(ingredient_texts)
+        
+        # Parse ingredients into list
+        ingredients_list = []
+        if ingredients_text:
+            for ing in ingredients_text.split(","):
+                ing = ing.strip()
+                if ing:
+                    ingredients_list.append(str(ing))
+        
+        # Add parsed ingredients to response
+        product_data["ingredients_text"] = ingredients_text
+        product_data["ingredients_list"] = ingredients_list
+        product_data["has_ingredients"] = len(ingredients_list) > 0
+        
+        logger.info(f"[FAST] Found product: {product_data.get('name')} with {len(ingredients_list)} ingredients")
+        
+        return {
+            'success': True,
+            'found': True,
+            'product': product_data,
+            'message': f'Product found: {product_data.get("name", "Unknown")}'
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during barcode lookup: {e}")
+        raise HTTPException(status_code=500, detail=f"Error looking up barcode: {str(e)}")
+
+
+class IngredientsAnalyzeRequest(BaseModel):
+    """Request model for ingredients analysis"""
+    barcode: str
+    product_data: Optional[Dict[str, Any]] = None  # Optional: reuse data from /barcode/lookup
+
+
+class IngredientsSeparateRequest(BaseModel):
+    """Request model for fast ingredient separation (names only)"""
+    barcode: str
+    product_data: Optional[Dict[str, Any]] = None
+
+
+class IngredientsDescribeRequest(BaseModel):
+    """Request model for ingredient descriptions"""
+    barcode: str
+    harmful_ingredients: list[str]
+    safe_ingredients: list[str]
+
+
+@router.post("/barcode/ingredients/separate")
+async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str, Any]:
+    """
+    FAST: Separate ingredients into harmful/safe (names only).
+    Takes 2-3 seconds. Call this first to show ingredient names immediately.
+    
+    Args:
+        request: Contains barcode and optional product_data
+        
+    Returns:
+        Harmful/safe ingredient names only (no descriptions)
+    """
+    try:
+        barcode = request.barcode.strip()
+        
+        if not barcode or not barcode.isdigit():
+            raise HTTPException(status_code=400, detail="Invalid barcode")
+        
+        logger.info(f"[INGREDIENTS-SEPARATE] Separating ingredients for barcode: {barcode}")
+        
+        # Get product data (use provided or fetch fresh)
+        if request.product_data:
+            product_data = request.product_data
+            logger.info("[INGREDIENTS-SEPARATE] Using provided product data (no API call)")
+        else:
+            barcode_service = get_barcode_service()
+            product_data = await barcode_service.lookup_barcode(barcode)
+            if not product_data:
+                raise HTTPException(status_code=404, detail="Product not found")
+        
+        # Get ingredients list
+        ingredients_list = product_data.get("ingredients_list", [])
+        ingredients_text = product_data.get("ingredients_text", "")
+        
+        # If no ingredients in provided data, try to extract
+        if not ingredients_list:
+            if not ingredients_text and "ingredients" in product_data:
+                ingredients_array = product_data["ingredients"]
+                for ing in ingredients_array:
+                    if isinstance(ing, dict) and ing.get("type") == "full_text":
+                        ingredients_text = ing.get("text", "")
+                        break
+                
+                if not ingredients_text:
+                    ingredient_texts = []
+                    for ing in ingredients_array:
+                        if isinstance(ing, dict) and ing.get("type") == "structured":
+                            text = ing.get("text") or ing.get("id", "").replace("en:", "").replace("-", " ")
+                            if text:
+                                ingredient_texts.append(text)
+                    ingredients_text = ", ".join(ingredient_texts)
+            
+            # Parse into list
+            if ingredients_text:
+                for ing in ingredients_text.split(","):
+                    ing = ing.strip()
+                    if ing:
+                        ingredients_list.append(str(ing))
+        
+        # AI INFERENCE if ingredients missing or minimal
+        if not ingredients_text or len(ingredients_text.strip()) < 20:
+            logger.info(f"[INGREDIENTS-SEPARATE] Minimal data - attempting AI inference")
+            inference_data = await infer_ingredients_from_context(
+                product_name=product_data.get("name", "Unknown"),
+                brand=product_data.get("brands", ""),
+                category=product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General",
+                image_url=product_data.get("image_url")
+            )
+            
+            if inference_data and inference_data.get("likely_ingredients"):
+                inferred_ingredients = ", ".join(inference_data["likely_ingredients"])
+                if inference_data.get("potential_additives"):
+                    inferred_ingredients += ", " + ", ".join(inference_data["potential_additives"])
+                
+                ingredients_text = ingredients_text + ", " + inferred_ingredients if ingredients_text else inferred_ingredients
+                
+                # Re-parse
+                ingredients_list = []
+                for ing in ingredients_text.split(","):
+                    ing = ing.strip()
+                    if ing:
+                        ingredients_list.append(str(ing))
+                
+                logger.info(f"[INGREDIENTS-SEPARATE] AI inference added {len(inference_data['likely_ingredients'])} ingredients")
+        
+        if not ingredients_list:
+            return {
+                'success': True,
+                'has_ingredients': False,
+                'harmful': [],
+                'safe': [],
+                'message': 'No ingredients found'
+            }
+        
+        # AI SEPARATION (FAST - only 1 AI call)
+        logger.info(f"[INGREDIENTS-SEPARATE] Separating {len(ingredients_list)} ingredients with AI")
+        separated = await separate_ingredients_with_ai(ingredients_list, [])
+        
+        harmful_ingredient_names = separated.get("harmful", [])
+        safe_ingredient_names = separated.get("safe", [])
+        
+        logger.info(f"[INGREDIENTS-SEPARATE] Complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+        
+        return {
+            'success': True,
+            'has_ingredients': True,
+            'harmful': harmful_ingredient_names,
+            'safe': safe_ingredient_names,
+            'harmful_count': len(harmful_ingredient_names),
+            'safe_count': len(safe_ingredient_names),
+            'total_count': len(ingredients_list),
+            'message': f'Separated {len(ingredients_list)} ingredients'
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during ingredient separation: {e}")
+        raise HTTPException(status_code=500, detail=f"Error separating ingredients: {str(e)}")
+
+
+@router.post("/barcode/ingredients/describe")
+async def describe_ingredients(request: IngredientsDescribeRequest) -> Dict[str, Any]:
+    """
+    SLOW: Generate AI descriptions for separated ingredients.
+    Takes 3-5 seconds. Call after /separate to get detailed descriptions.
+    
+    Args:
+        request: Contains harmful and safe ingredient lists
+        
+    Returns:
+        AI-generated descriptions for each ingredient
+    """
+    try:
+        barcode = request.barcode.strip()
+        
+        if not barcode or not barcode.isdigit():
+            raise HTTPException(status_code=400, detail="Invalid barcode")
+        
+        logger.info(f"[INGREDIENTS-DESCRIBE] Generating descriptions for {len(request.harmful_ingredients)} harmful, {len(request.safe_ingredients)} safe ingredients")
+        
+        # Generate harmful chemicals list
+        harmful_chemicals = [
+            {"name": name, "type": "additive", "category": "additive"}
+            for name in request.harmful_ingredients
+        ]
+        
+        # GENERATE DESCRIPTIONS (SLOW - 2 AI calls)
+        ingredient_descriptions = get_detailed_ingredient_descriptions(
+            safe_ingredients=request.safe_ingredients,
+            harmful_ingredients=request.harmful_ingredients,
+            harmful_chemicals_db=harmful_chemicals
+        )
+        
+        logger.info(f"[INGREDIENTS-DESCRIBE] Descriptions generated")
+        
+        return {
+            'success': True,
+            'descriptions': ingredient_descriptions,
+            'message': 'Descriptions generated successfully'
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating ingredient descriptions: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating descriptions: {str(e)}")
+
+
+@router.post("/barcode/ingredients/analyze")
+async def analyze_ingredients(request: IngredientsAnalyzeRequest) -> Dict[str, Any]:
+    """
+    MEDIUM: AI-powered ingredient analysis (separation + descriptions).
+    Takes 5-10 seconds. Call after /barcode/lookup.
+    
+    Args:
+        request: Contains barcode and optional product_data
+        
+    Returns:
+        Harmful/safe ingredient separation with AI descriptions
+    """
+    try:
+        barcode = request.barcode.strip()
+        
+        if not barcode or not barcode.isdigit():
+            raise HTTPException(status_code=400, detail="Invalid barcode")
+        
+        logger.info(f"[INGREDIENTS] Analyzing ingredients for barcode: {barcode}")
+        
+        # Get product data (use provided or fetch fresh)
+        if request.product_data:
+            product_data = request.product_data
+            logger.info("[INGREDIENTS] Using provided product data (no API call)")
+        else:
+            barcode_service = get_barcode_service()
+            product_data = await barcode_service.lookup_barcode(barcode)
+            if not product_data:
+                raise HTTPException(status_code=404, detail="Product not found")
+        
+        # Get ingredients list
+        ingredients_list = product_data.get("ingredients_list", [])
+        ingredients_text = product_data.get("ingredients_text", "")
+        
+        # If no ingredients in provided data, try to extract
+        if not ingredients_list:
+            if not ingredients_text and "ingredients" in product_data:
+                ingredients_array = product_data["ingredients"]
+                for ing in ingredients_array:
+                    if isinstance(ing, dict) and ing.get("type") == "full_text":
+                        ingredients_text = ing.get("text", "")
+                        break
+                
+                if not ingredients_text:
+                    ingredient_texts = []
+                    for ing in ingredients_array:
+                        if isinstance(ing, dict) and ing.get("type") == "structured":
+                            text = ing.get("text") or ing.get("id", "").replace("en:", "").replace("-", " ")
+                            if text:
+                                ingredient_texts.append(text)
+                    ingredients_text = ", ".join(ingredient_texts)
+            
+            # Parse into list
+            if ingredients_text:
+                for ing in ingredients_text.split(","):
+                    ing = ing.strip()
+                    if ing:
+                        ingredients_list.append(str(ing))
+        
+        # AI INFERENCE if ingredients missing or minimal
+        if not ingredients_text or len(ingredients_text.strip()) < 20:
+            logger.info(f"[INGREDIENTS] Minimal data - attempting AI inference")
+            inference_data = await infer_ingredients_from_context(
+                product_name=product_data.get("name", "Unknown"),
+                brand=product_data.get("brands", ""),
+                category=product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General",
+                image_url=product_data.get("image_url")
+            )
+            
+            if inference_data and inference_data.get("likely_ingredients"):
+                inferred_ingredients = ", ".join(inference_data["likely_ingredients"])
+                if inference_data.get("potential_additives"):
+                    inferred_ingredients += ", " + ", ".join(inference_data["potential_additives"])
+                
+                ingredients_text = ingredients_text + ", " + inferred_ingredients if ingredients_text else inferred_ingredients
+                
+                # Re-parse
+                ingredients_list = []
+                for ing in ingredients_text.split(","):
+                    ing = ing.strip()
+                    if ing:
+                        ingredients_list.append(str(ing))
+                
+                logger.info(f"[INGREDIENTS] AI inference added {len(inference_data['likely_ingredients'])} ingredients")
+        
+        if not ingredients_list:
+            return {
+                'success': True,
+                'has_ingredients': False,
+                'harmful': [],
+                'safe': [],
+                'descriptions': {'harmful': {}, 'safe': {}},
+                'message': 'No ingredients found for analysis'
+            }
+        
+        # AI SEPARATION
+        logger.info(f"[INGREDIENTS] Separating {len(ingredients_list)} ingredients with AI")
+        separated = await separate_ingredients_with_ai(ingredients_list, [])
+        
+        harmful_ingredient_names = separated.get("harmful", [])
+        safe_ingredient_names = separated.get("safe", [])
+        
+        logger.info(f"[INGREDIENTS] AI separation: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+        
+        # Generate harmful chemicals list
+        harmful_chemicals = [
+            {"name": name, "type": "additive", "category": "additive"}
+            for name in harmful_ingredient_names
+        ]
+        
+        # GENERATE DESCRIPTIONS
+        logger.info(f"[INGREDIENTS] Generating AI descriptions")
+        ingredient_descriptions = get_detailed_ingredient_descriptions(
+            safe_ingredients=safe_ingredient_names,
+            harmful_ingredients=harmful_ingredient_names,
+            harmful_chemicals_db=harmful_chemicals
+        )
+        
+        logger.info(f"[INGREDIENTS] Analysis complete")
+        
+        return {
+            'success': True,
+            'has_ingredients': True,
+            'harmful': harmful_ingredient_names,
+            'safe': safe_ingredient_names,
+            'harmful_count': len(harmful_ingredient_names),
+            'safe_count': len(safe_ingredient_names),
+            'descriptions': ingredient_descriptions,
+            'message': f'Analyzed {len(ingredients_list)} ingredients'
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during ingredient analysis: {e}")
+        raise HTTPException(status_code=500, detail=f"Error analyzing ingredients: {str(e)}")
+
+
+class PackagingAnalyzeRequest(BaseModel):
+    """Request model for packaging analysis"""
+    barcode: str
+    product_data: Optional[Dict[str, Any]] = None
+
+
+class PackagingSeparateRequest(BaseModel):
+    """Request model for fast packaging material extraction (names only)"""
+    barcode: str
+    product_data: Optional[Dict[str, Any]] = None
+
+
+class PackagingDescribeRequest(BaseModel):
+    """Request model for packaging material descriptions"""
+    barcode: str
+    packaging_text: str
+    packaging_tags: list[str]
+
+
+@router.post("/barcode/packaging/separate")
+async def separate_packaging(request: PackagingSeparateRequest) -> Dict[str, Any]:
+    """
+    FAST: Extract packaging material names only.
+    Takes 1-2 seconds. Call this first to show material names immediately.
+    
+    Args:
+        request: Contains barcode and optional product_data
+        
+    Returns:
+        Packaging material names only (no detailed analysis)
+    """
+    try:
+        barcode = request.barcode.strip()
+        
+        if not barcode or not barcode.isdigit():
+            raise HTTPException(status_code=400, detail="Invalid barcode")
+        
+        logger.info(f"[PACKAGING-SEPARATE] Extracting packaging materials for barcode: {barcode}")
+        
+        # Get product data (use provided or fetch fresh)
+        if request.product_data:
+            product_data = request.product_data
+            logger.info("[PACKAGING-SEPARATE] Using provided product data (no API call)")
+        else:
+            barcode_service = get_barcode_service()
+            product_data = await barcode_service.lookup_barcode(barcode)
+            if not product_data:
+                raise HTTPException(status_code=404, detail="Product not found")
+        
+        # Extract packaging info
+        packaging_text = product_data.get("packaging", "")
+        packaging_tags = product_data.get("packaging_tags", [])
+        
+        # Check if packaging info is nested in materials object
+        if not packaging_text and "materials" in product_data:
+            materials = product_data["materials"]
+            packaging_text = materials.get("packaging_text", "") or materials.get("packaging", "")
+            packaging_tags = materials.get("packaging_tags", [])
+        
+        logger.info(f"[PACKAGING-SEPARATE] Packaging text: '{packaging_text}', Tags: {packaging_tags}")
+        
+        # INFER PACKAGING IF MISSING
+        packaging_source = "openfacts"
+        if not packaging_text and not packaging_tags:
+            logger.info("[PACKAGING-SEPARATE] No data from OpenFacts - attempting AI inference")
+            
+            # Fallback to AI category-based inference
+            category = product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General product"
+            packaging_inference = await infer_packaging_from_category(
+                product_name=product_data.get("name", "Unknown"),
+                category=category
+            )
+            if packaging_inference:
+                packaging_text = packaging_inference
+                packaging_source = "ai_inferred"
+                logger.info(f"[PACKAGING-SEPARATE] Using AI-inferred packaging: {packaging_text}")
+        
+        # Extract material names (simple parsing)
+        materials = []
+        if packaging_tags:
+            materials = packaging_tags
+        elif packaging_text:
+            # Simple extraction - split by common delimiters
+            for delimiter in [',', '\n', '-', '•']:
+                if delimiter in packaging_text:
+                    materials = [m.strip() for m in packaging_text.split(delimiter) if m.strip()]
+                    break
+            if not materials:
+                materials = [packaging_text.strip()]
+        
+        logger.info(f"[PACKAGING-SEPARATE] Extracted {len(materials)} materials")
+        
+        return {
+            'success': True,
+            'has_packaging_data': len(materials) > 0,
+            'materials': materials,
+            'packaging_text': packaging_text,
+            'packaging_tags': packaging_tags,
+            'source': packaging_source,
+            'message': f'Extracted {len(materials)} packaging materials'
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during packaging separation: {e}")
+        raise HTTPException(status_code=500, detail=f"Error extracting packaging materials: {str(e)}")
+
+
+@router.post("/barcode/packaging/describe")
+async def describe_packaging(request: PackagingDescribeRequest) -> Dict[str, Any]:
+    """
+    SLOW: Generate detailed analysis for packaging materials.
+    Takes 3-5 seconds. Call after /separate to get detailed descriptions.
+    
+    Args:
+        request: Contains packaging text and tags
+        
+    Returns:
+        Detailed AI-generated analysis for each material
+    """
+    try:
+        barcode = request.barcode.strip()
+        
+        if not barcode or not barcode.isdigit():
+            raise HTTPException(status_code=400, detail="Invalid barcode")
+        
+        logger.info(f"[PACKAGING-DESCRIBE] Analyzing {len(request.packaging_tags)} packaging materials")
+        
+        # ANALYZE PACKAGING (SLOW - 1 AI call)
+        packaging_analysis = analyze_packaging_material(request.packaging_text, request.packaging_tags)
+        
+        logger.info(f"[PACKAGING-DESCRIBE] Analysis complete")
+        
+        return {
+            'success': True,
+            'analysis': packaging_analysis,
+            'message': 'Packaging analysis complete'
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating packaging descriptions: {e}")
+        raise HTTPException(status_code=500, detail=f"Error analyzing packaging: {str(e)}")
+
+
+@router.post("/barcode/packaging/analyze")
+async def analyze_packaging(request: PackagingAnalyzeRequest) -> Dict[str, Any]:
+    """
+    MEDIUM: AI-powered packaging analysis.
+    Takes 3-7 seconds. Call after /barcode/lookup.
+    
+    Args:
+        request: Contains barcode and optional product_data
+        
+    Returns:
+        Packaging materials, safety analysis, recyclability
+    """
+    try:
+        barcode = request.barcode.strip()
+        
+        if not barcode or not barcode.isdigit():
+            raise HTTPException(status_code=400, detail="Invalid barcode")
+        
+        logger.info(f"[PACKAGING] Analyzing packaging for barcode: {barcode}")
+        
+        # Get product data (use provided or fetch fresh)
+        if request.product_data:
+            product_data = request.product_data
+            logger.info("[PACKAGING] Using provided product data (no API call)")
+        else:
+            barcode_service = get_barcode_service()
+            product_data = await barcode_service.lookup_barcode(barcode)
+            if not product_data:
+                raise HTTPException(status_code=404, detail="Product not found")
+        
+        # Extract packaging info
+        packaging_text = product_data.get("packaging", "")
+        packaging_tags = product_data.get("packaging_tags", [])
+        
+        # Check if packaging info is nested in materials object
+        if not packaging_text and "materials" in product_data:
+            materials = product_data["materials"]
+            packaging_text = materials.get("packaging_text", "") or materials.get("packaging", "")
+            packaging_tags = materials.get("packaging_tags", [])
+        
+        logger.info(f"[PACKAGING] Packaging text: '{packaging_text}', Tags: {packaging_tags}")
+        
+        # INFER PACKAGING IF MISSING
+        packaging_source = "openfacts"
+        if not packaging_text and not packaging_tags:
+            logger.info("[PACKAGING] No data from OpenFacts - attempting web search + AI inference")
+            
+            # Try web search first
+            web_packaging = await search_packaging_info(
+                product_name=product_data.get("name", "Unknown"),
+                brand=product_data.get("brands", ""),
+                category=product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General"
+            )
+            
+            if web_packaging:
+                packaging_text = web_packaging
+                packaging_source = "web_search"
+                logger.info(f"[PACKAGING] Using web-searched packaging: {packaging_text}")
+            else:
+                # Fallback to AI category-based inference
+                category = product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General product"
+                packaging_inference = await infer_packaging_from_category(
+                    product_name=product_data.get("name", "Unknown"),
+                    category=category
+                )
+                if packaging_inference:
+                    packaging_text = packaging_inference
+                    packaging_source = "ai_inferred"
+                    logger.info(f"[PACKAGING] Using AI-inferred packaging: {packaging_text}")
+        
+        # ANALYZE PACKAGING
+        if packaging_text or packaging_tags:
+            logger.info(f"[PACKAGING] Analyzing packaging materials")
+            packaging_analysis = analyze_packaging_material(packaging_text, packaging_tags)
+            packaging_analysis["source"] = packaging_source
+            logger.info(f"[PACKAGING] Analysis complete: {len(packaging_analysis.get('materials', []))} materials")
+            
+            return {
+                'success': True,
+                'has_packaging_data': True,
+                'analysis': packaging_analysis,
+                'message': 'Packaging analysis complete'
+            }
+        else:
+            logger.info("[PACKAGING] No packaging data available")
+            return {
+                'success': True,
+                'has_packaging_data': False,
+                'analysis': {
+                    "materials": [],
+                    "analysis": {},
+                    "overall_safety": "unknown",
+                    "summary": "No packaging information available",
+                    "source": "none"
+                },
+                'message': 'No packaging information available'
+            }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during packaging analysis: {e}")
+        raise HTTPException(status_code=500, detail=f"Error analyzing packaging: {str(e)}")
+
+
+async def generate_harmful_descriptions(harmful_ingredients: list) -> dict:
+    """Generate descriptions for harmful ingredients"""
+    try:
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        harmful_str = ", ".join(harmful_ingredients[:15])
+        
+        prompt = f"""For these harmful ingredients, provide brief descriptions:
+{harmful_str}
+
+Return JSON only: {{"ingredient_name": "brief harmful description"}}"""
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=800,
+            response_format={"type": "json_object"}
+        )
+        
+        return json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        logger.error(f"Failed to generate harmful descriptions: {e}")
+        return {}
+
+
+async def generate_safe_descriptions(safe_ingredients: list) -> dict:
+    """Generate descriptions for safe ingredients"""
+    try:
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        safe_str = ", ".join(safe_ingredients[:15])
+        
+        prompt = f"""For these safe ingredients, provide brief descriptions:
+{safe_str}
+
+Return JSON only: {{"ingredient_name": "brief description"}}"""
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=800,
+            response_format={"type": "json_object"}
+        )
+        
+        return json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        logger.error(f"Failed to generate safe descriptions: {e}")
+        return {}
+
+
+
+@router.post("/lookup-barcode-basic")
+async def lookup_barcode_basic(request: BarcodeLookupRequest) -> Dict[str, Any]:
+    """
+    Fast barcode lookup returning only essential product data.
+    Use this for initial page load, then fetch detailed analysis asynchronously.
+    
+    This endpoint:
+    - Returns in ~1-3 seconds (vs 20-30s for full endpoint)
+    - Provides: name, brand, image, basic safety score
+    - Skips: AI descriptions, packaging analysis, recommendations
+    
+    Args:
+        request: Barcode lookup request containing the barcode string
+        
+    Returns:
+        Basic product information with minimal processing
+    """
+    try:
+        barcode = request.barcode.strip()
+        
+        # Validate barcode
+        if not barcode:
+            raise HTTPException(
+                status_code=400,
+                detail="Barcode cannot be empty"
+            )
+        
+        if not barcode.isdigit():
+            raise HTTPException(
+                status_code=400,
+                detail="Barcode must contain only digits"
+            )
+        
+        logger.info(f"Basic lookup for barcode: {barcode}")
+        
+        # Query barcode service (with caching)
+        barcode_service = get_barcode_service()
+        product_data = await barcode_service.lookup_barcode(barcode)
+        
+        if not product_data:
+            return {
+                'success': True,
+                'found': False,
+                'product': None,
+                'message': 'Product not found in database'
+            }
+        
+        # Extract basic ingredients for safety check only
+        ingredients_text = product_data.get("ingredients_text", "")
+        
+        # Quick chemical check (no AI processing)
+        detected_chemicals = []
+        safety_score = 100
+        
+        if ingredients_text:
+            detected_chemicals = check_ingredients(ingredients_text)
+            safety_score = calculate_safety_score(detected_chemicals)
+        
+        # Return minimal product data
+        basic_product = {
+            "barcode": product_data.get("barcode", barcode),
+            "name": product_data.get("name", "Unknown Product"),
+            "brand": product_data.get("brand", ""),
+            "categories": product_data.get("categories", ""),
+            "image_url": product_data.get("image_url", ""),
+            "source": product_data.get("source", ""),
+            "safety_score": safety_score,
+            "has_harmful_chemicals": len(detected_chemicals) > 0,
+            "harmful_count": len(detected_chemicals),
+            "labels": product_data.get("labels", ""),
+            "url": product_data.get("url", ""),
+        }
+        
+        logger.info(f"Basic lookup complete for {barcode}: {basic_product['name']}")
+        
+        return {
+            'success': True,
+            'found': True,
+            'product': basic_product,
+            'message': f'Product found: {basic_product["name"]}',
+            'note': 'This is basic data. Call /lookup-barcode for full analysis.'
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during basic barcode lookup: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Error looking up barcode: {str(e)}"
@@ -1739,10 +2659,13 @@ async def get_barcode_recommendations(request: BarcodeLookupRequest) -> Dict[str
         }
     """
     try:
-        barcode_service = get_barcode_service()
-        
-        # Fetch product data from barcode (await async function)
-        product_data = await barcode_service.lookup_barcode(request.barcode)
+        # Use pre-fetched product data if provided, otherwise fetch from barcode
+        if request.product_data:
+            product_data = request.product_data
+            logger.info(f"Using pre-fetched product data for barcode {request.barcode} (avoiding redundant API call)")
+        else:
+            barcode_service = get_barcode_service()
+            product_data = await barcode_service.lookup_barcode(request.barcode)
         
         if not product_data:
             return {
