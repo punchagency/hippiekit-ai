@@ -158,7 +158,7 @@ IMPORTANT: Return ONLY valid JSON in this exact format:
 async def infer_packaging_from_category(
     product_name: str,
     category: str
-) -> Optional[str]:
+) -> Optional[List[str]]:
     """
     Infer likely packaging materials based on product category.
     
@@ -167,7 +167,7 @@ async def infer_packaging_from_category(
         category: Product category
         
     Returns:
-        Inferred packaging material description or None
+        List of inferred packaging materials or None
     """
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -177,21 +177,43 @@ async def infer_packaging_from_category(
 Product: {product_name}
 Category: {category}
 
-Provide ONLY a brief list of typical packaging materials (e.g., "Plastic wrapper, cardboard box"). Be realistic and conservative."""
+Return ONLY a JSON array of packaging material names. Be realistic and conservative.
+Example: ["Plastic wrapper", "Cardboard box", "Aluminum foil"]
+
+Limit to 3-4 most common materials."""
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a packaging industry expert. Provide realistic, conservative estimates of typical packaging materials."},
+                {"role": "system", "content": "You are a packaging industry expert. Return only valid JSON arrays of packaging materials."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
-            max_tokens=100
+            max_tokens=100,
+            response_format={"type": "json_object"}
         )
         
-        packaging = response.choices[0].message.content.strip()
-        logger.info(f"Inferred packaging from category: {packaging}")
-        return packaging
+        content = response.choices[0].message.content.strip()
+        
+        # Parse JSON response
+        try:
+            # Try direct JSON parse
+            result = json.loads(content)
+            # Handle if wrapped in object like {"materials": [...]}
+            if isinstance(result, dict):
+                materials = result.get("materials", list(result.values())[0] if result else [])
+            else:
+                materials = result
+                
+            if isinstance(materials, list) and materials:
+                logger.info(f"Inferred packaging from category: {materials}")
+                return materials
+            else:
+                logger.warning(f"Invalid packaging inference format: {content}")
+                return None
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse packaging inference JSON: {e}")
+            return None
         
     except Exception as e:
         logger.error(f"Packaging category inference failed: {e}")
@@ -520,7 +542,7 @@ async def get_product_recommendations_for_barcode(
             category = product_data['categories'].split(',')[0].strip()
         
         product_name = product_data.get('name', '')
-        brand = product_data.get('brand', '')
+        brand = product_data.get('brands', '')
         text_query = f"{product_name} {brand} {category}".strip()
         
         logger.info(f"Generating text embedding for: {text_query}")
@@ -731,7 +753,7 @@ Examples:
 Return ONLY a JSON array of relevance scores (1-10) for each candidate in order:
 [10, 8, 1, 1, ...]
 
-Be strict: Only food products can replace food. Don't recommend home goods for snacks."""
+Be strict: Match product categories exactly. Food replaces food. Beauty replaces beauty. Cleaning replaces cleaning. Don't cross categories."""
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -801,15 +823,15 @@ async def generate_ai_product_alternatives(
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
-        prompt = f"""You are a holistic nutritionist and clean eating expert. A customer scanned "{product_name}" (category: {category}) and it contains harmful additives.
+        prompt = f"""You are a health and eco-conscious product expert. A customer scanned "{product_name}" (category: {category}) and it contains harmful additives.
 
 Recommend {count} REAL, SPECIFIC healthier alternative products with ACTUAL BRAND NAMES that they can buy instead.
 
 CRITICAL RULES:
-1. Use REAL brand names (e.g., "Amy's Organic", "Annie's Homegrown", "Nature's Path")
-2. Focus on organic, plant-based, clean-label brands
-3. Match the product category and use case
-4. Explain WHY each alternative is healthier (no harmful additives, organic ingredients, etc.)
+1. Use REAL brand names (e.g., "Dr. Bronner's", "Seventh Generation", "Amy's Organic", "Honest Company")
+2. Focus on organic, plant-based, clean-label, eco-friendly brands
+3. Match the product category and use case (food for food, beauty for beauty, cleaning for cleaning)
+4. Explain WHY each alternative is healthier/cleaner (no harmful additives, organic ingredients, eco-friendly, etc.)
 5. Be specific - not generic suggestions
 
 Format as JSON array:
@@ -845,7 +867,7 @@ Now generate {count} alternatives for "{product_name}" (category: {category}):""
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a holistic nutritionist specializing in clean eating and organic products. You recommend specific real brands and products."},
+                {"role": "system", "content": "You are a health and eco-conscious product expert specializing in clean/natural alternatives across all consumer product categories (food, beauty, cleaning, personal care). You recommend specific real brands and products."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
@@ -889,198 +911,126 @@ Now generate {count} alternatives for "{product_name}" (category: {category}):""
         return []
 
 
-def parse_nested_ingredients(ingredients_text: str) -> List[str]:
-    """
-    Parse ingredients text and extract ALL ingredients including nested ones in parentheses/brackets.
-    
-    Example:
-        "ENRICHED WHEAT FLOUR (WHEAT, IRON, NIACIN), SUGAR" 
-        → ["ENRICHED WHEAT FLOUR", "WHEAT", "IRON", "NIACIN", "SUGAR"]
-    
-    Args:
-        ingredients_text: Raw comma-separated ingredients text
-        
-    Returns:
-        List of all ingredients (parent + nested)
-    """
-    if not ingredients_text:
-        return []
-    
-    all_ingredients = []
-    
-    # Strategy: Find all ingredients with parentheses FIRST (as complete units)
-    # Pattern: "INGREDIENT (NESTED, STUFF, HERE)" - captures everything including nested commas
-    parentheses_pattern = r'([^,]+\([^)]+\))'
-    
-    # Find all ingredients with parentheses
-    ingredients_with_parens = re.findall(parentheses_pattern, ingredients_text)
-    
-    # Process each ingredient with parentheses
-    for match in ingredients_with_parens:
-        # Extract parent ingredient (before opening parenthesis)
-        parent = re.split(r'[\(\[]', match)[0].strip()
-        if parent:
-            all_ingredients.append(parent)
-        
-        # Extract nested ingredients inside parentheses
-        nested_match = re.search(r'[\(\[]([^\)\]]+)[\)\]]', match)
-        if nested_match:
-            nested_text = nested_match.group(1)
-            # Split nested ingredients by comma or &
-            nested_parts = re.split(r'[,&]', nested_text)
-            for nested in nested_parts:
-                nested = nested.strip()
-                if nested:
-                    all_ingredients.append(nested)
-    
-    # Remove all parenthesized ingredients from the original text to avoid double-processing
-    cleaned_text = ingredients_text
-    for match in ingredients_with_parens:
-        cleaned_text = cleaned_text.replace(match, '')
-    
-    # Now split remaining text by comma to get simple ingredients
-    simple_parts = [p.strip() for p in cleaned_text.split(',') if p.strip()]
-    all_ingredients.extend(simple_parts)
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_ingredients = []
-    for ing in all_ingredients:
-        ing_clean = ing.strip().upper()
-        if ing_clean and ing_clean not in seen:
-            seen.add(ing_clean)
-            unique_ingredients.append(ing.strip())
-    
-    logger.info(f"Parsed nested ingredients: {len(unique_ingredients)} total")
-    return unique_ingredients
-
-
-# Hard guardrail keywords - ingredients containing these are ALWAYS flagged as harmful
-AUTO_HARMFUL_KEYWORDS = [
-    # Added sugars
-    "sugar", "syrup", "dextrose", "glucose", "fructose", "maltodextrin",
-    "sucralose", "aspartame", "saccharin", "acesulfame",
-    
-    # Fillers / modified
-    "modified", "starch", "hydrolyzed",
-    
-    # Flavorings
-    "flavor", "flavour", "flavoring", "flavouring",
-    
-    # Dyes / colorants (E-numbers)
-    "color", "colour", "e1", "e2", "e3", "e4", "e5",
-    "red 40", "yellow 5", "yellow 6", "blue 1", "blue 2",
-    
-    # Preservatives
-    "preservative", "benzoate", "sorbate", "nitrite", "nitrate",
-    "bht", "bha", "tbhq",
-    
-    # Oils (refined/processed)
-    "canola oil", "vegetable oil", "palm oil", "soybean oil",
-    "partially hydrogenated", "hydrogenated",
-    
-    # Emulsifiers/stabilizers
-    "polysorbate", "carrageenan", "xanthan", "guar gum",
-    "mono and diglycerides", "lecithin"
-]
-
-
 async def separate_ingredients_with_ai(
-    ingredients_list: List[str],
+    ingredients_text: str,
     harmful_chemicals_db: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
     """
-    Use OpenAI to intelligently categorize ingredients as harmful or safe.
+    Use OpenAI to intelligently PARSE and categorize ingredients as harmful or safe.
     
-    CRITICAL: AI uses chemical database as REFERENCE only (not for alias matching).
-    AI makes decisions based on:
-    1. Whether ingredient is present in the database
-    2. Its own nutritional/chemical knowledge
+    The AI will:
+    1. Parse the raw ingredients text (handling parentheses, nested ingredients, etc.)
+    2. Extract individual ingredients correctly
+    3. Categorize each as harmful or safe based on clean/natural product principles
     
     Args:
-        ingredients_list: Full list of ingredients (already parsed with nested ones extracted)
+        ingredients_text: Raw ingredients text from product label (unparsed)
         harmful_chemicals_db: Database of harmful chemicals (REFERENCE ONLY - not for alias matching)
         
     Returns:
         {
             "harmful": ["Red 40", "Yellow 5", ...],
-            "safe": ["Sugar", "Water", ...]
+            "safe": ["Cocoa Butter", "Water", ...]
         }
     """
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
-        # STEP 1: Pre-flag obvious harmful ingredients (confidence guardrail)
-        pre_flagged_harmful = [
-            ing for ing in ingredients_list
-            if any(keyword in ing.lower() for keyword in AUTO_HARMFUL_KEYWORDS)
-        ]
+        if not ingredients_text or not ingredients_text.strip():
+            return {"harmful": [], "safe": []}
         
-        logger.info(f"Pre-flagged {len(pre_flagged_harmful)} ingredients as harmful based on keywords")
+        logger.info(f"Raw ingredients text: {ingredients_text[:200]}...")
         
-        # Extract chemical names from database as REFERENCE (not for matching)
-        harmful_chemical_names = [chem['chemical'] for chem in harmful_chemicals_db]
-        
-        # STEP 2: Create prompt for AI categorization with guardrail enforcement
+        # STEP 1: Create prompt for AI to PARSE AND CATEGORIZE in one step
         prompt = f"""
-            You are a STRICT whole-food ingredient reviewer similar to the Bobby Approved app.
+You are a STRICT hippie/health-obsessed ingredient reviewer. Be EXTREMELY strict.
 
-            INGREDIENT LIST (EXACT TEXT):
-            {', '.join(ingredients_list)}
+RAW INGREDIENT TEXT FROM PRODUCT LABEL:
+{ingredients_text}
 
-            PRE-FLAGGED HARMFUL INGREDIENTS (NON-NEGOTIABLE):
-            {', '.join(pre_flagged_harmful) if pre_flagged_harmful else 'None'}
+TASKS:
+1. PARSE correctly - extract ALL ingredients including nested ones in parentheses
+   Example: "Milk Chocolate (sugar, cocoa butter, soy lecithin)" extracts:
+   Milk Chocolate, sugar, cocoa butter, soy lecithin
 
-            CRITICAL RULE:
-            - Any ingredient listed in PRE-FLAGGED HARMFUL INGREDIENTS above MUST be classified as HARMFUL
-            - You are NOT allowed to move them to SAFE under any circumstances
-            - These are non-negotiable based on whole-food principles
+2. CATEGORIZE as HARMFUL or SAFE:
 
-            CORE PHILOSOPHY:
-            - If an ingredient is NOT clearly a whole, natural, minimally processed food → FLAG IT
-            - When in doubt → FLAG IT
-            - Added sugar IS considered harmful
-            - “Natural flavor”, “flavourings”, or vague terms → harmful
-            - E-numbers, dyes, preservatives → harmful
-            - Industrial or lab-modified ingredients → harmful
+CRITICAL: Assume ALL ingredients HARMFUL unless explicitly organic or truly raw/unprocessed.
 
-            DEFINITION:
-            HARMFUL means:
-            - Synthetic or artificial
-            - Ultra-processed
-            - Chemically modified
-            - Added sugars
-            - Fillers, stabilizers, colorants, preservatives
-            - Anything a human would not normally cook with at home
+ALWAYS HARMFUL:
 
-            SAFE means:
-            - Single-ingredient whole foods
-            - Minimally processed
-            - Traditionally used in home cooking
+SWEETENERS (all forms):
+- Sugar, cane sugar, brown sugar (unless "organic cane sugar")
+- Corn syrup, glucose syrup, rice syrup, fructose, dextrose, maltodextrin
+- Artificial sweeteners: sucralose, aspartame, saccharin, acesulfame
+- Molasses, agave, honey (unless raw organic)
 
-            RULES:
-            - Return ingredient names EXACTLY as written
-            - Each ingredient MUST appear in only ONE list
-            - Do NOT explain
-            - Do NOT add extra text
-            - Output ONLY valid JSON
+SEED OILS (chemically extracted, GMO, hexane-processed):
+- Vegetable oil, canola oil, rapeseed oil
+- Soybean oil, corn oil, cottonseed oil
+- Sunflower oil, safflower oil, grapeseed oil (unless cold-pressed organic)
+- Palm oil (unless certified organic)
+- Hydrogenated/partially hydrogenated oils
 
-            JSON FORMAT:
-            {{
-            "harmful": [],
-            "safe": []
-            }}
-            """
+NON-ORGANIC AGRICULTURAL INGREDIENTS (pesticides, GMOs, glyphosate):
+- Cocoa, cocoa butter, cacao (unless organic)
+- Milk, cream, butter, cheese, whey (unless organic - GMO feed, hormones)
+- Eggs (unless organic/pasture-raised - GMO feed)
+- Wheat, flour, oats, corn, soy (unless organic - GMO, glyphosate)
+- Soy lecithin (unless organic - 90% GMO)
+- Rice, grains (unless organic)
+- Chocolate (unless organic)
+- ANY agricultural ingredient NOT labeled "organic"
 
+SYNTHETIC ADDITIVES:
+- Modified/hydrolyzed anything
+- Natural flavor, artificial flavor, flavoring, flavouring
+- Colors, E-numbers, dyes (Red 40, Yellow 5, Blue 1, etc.)
+- Preservatives: benzoate, sorbate, nitrite, nitrate, BHT, BHA, TBHQ
+- Emulsifiers: polysorbate, mono/diglycerides, DATEM
+- Thickeners: carrageenan, xanthan gum, guar gum, cellulose gum
+- Sodium compounds (sodium benzoate, disodium EDTA, etc.)
+
+ULTRA-PROCESSED:
+- Maltodextrin, isolated proteins, protein concentrates
+- Enriched, fortified, refined anything
+- Lecithin (unless organic)
+
+PHILOSOPHY:
+- NOT organic → HARMFUL (pesticides, GMOs assumed)
+- Ultra-processed → HARMFUL
+- Synthetic → HARMFUL
+- Refined → HARMFUL
+- Seed oils → HARMFUL
+- When in doubt → HARMFUL
+
+SAFE (VERY STRICT):
+- Water, sea salt, Himalayan salt
+- Explicitly "organic" whole foods only
+- Cold-pressed organic oils (olive, coconut, avocado)
+- Raw unprocessed ingredients
+
+RULES:
+- Extract ALL ingredients (no parentheses in names)
+- Each ingredient in ONE list only
+- NO explanations
+- Output ONLY valid JSON
+
+JSON:
+{{
+"harmful": ["ingredient1", "ingredient2"],
+"safe": ["ingredient3"]
+}}
+"""
 
         response = client.chat.completions.create(
-            model="gpt-4.1",
+            model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are an expert at matching ingredient names against chemical databases, understanding name variations and aliases."},
+                {"role": "system", "content": "You are an expert at parsing ingredient labels and categorizing ingredients based on clean/natural product principles for ALL consumer products (food, beauty, cleaning, personal care). You understand nested ingredients, formatting variations, and can extract all individual ingredients from complex ingredient text."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,
-            max_tokens=1000
+            max_tokens=1500
         )
         
         content = response.choices[0].message.content.strip()
@@ -1092,24 +1042,14 @@ async def separate_ingredients_with_ai(
         
         result = json.loads(content)
         
-        # STEP 3: Post-AI Safety Check - Enforce guardrail after AI response
-        # This ensures pre-flagged ingredients are ALWAYS in harmful, even if AI made a mistake
-        result["harmful"] = list(set(result.get("harmful", []) + pre_flagged_harmful))
-        
-        # Remove any pre-flagged ingredients from safe list (prevents duplicates)
-        result["safe"] = [
-            ing for ing in result.get("safe", [])
-            if ing not in result["harmful"]
-        ]
-        
-        logger.info(f"AI separated ingredients: {len(result.get('harmful', []))} harmful, {len(result.get('safe', []))} safe (after guardrail enforcement)")
+        logger.info(f"AI parsed and separated ingredients: {len(result.get('harmful', []))} harmful, {len(result.get('safe', []))} safe")
         
         return result
         
     except Exception as e:
-        logger.error(f"AI ingredient separation failed: {e}")
+        logger.error(f"AI ingredient parsing/separation failed: {e}")
         # Fallback to empty lists
-        return {"harmful": [], "safe": ingredients_list}
+        return {"harmful": [], "safe": []}
 
 
 def get_detailed_ingredient_descriptions(
@@ -1164,8 +1104,8 @@ FLAGGED CHEMICALS (authoritative — do not dispute or soften):
 {harmful_str}
 
 For each chemical, provide a description that:
-1. States what the chemical is and its industrial/synthetic use in products
-2. Explains why it's harmful to human health and/or the environment from a whole-food, natural nutrition perspective
+1. States what the chemical is and its industrial/synthetic use in consumer products (food, beauty, cleaning, etc.)
+2. Explains why it's harmful to human health and/or the environment from a clean/natural product perspective
 3. Calls out specific health risks, toxicity concerns, or environmental damage
 4. Uses clear, direct language - no corporate apologetics or "generally regarded as safe" phrases
 
@@ -1186,14 +1126,14 @@ Harmful chemicals: {harmful_str}"""
                     messages=[
                         {
                             "role": "system", 
-                            "content": """You are a strict, anti-synthetic, whole-foods-only nutritionist and ingredient auditor.
+                            "content": """You are a strict, anti-synthetic ingredient auditor for ALL consumer products (food, beauty, cleaning, personal care).
 
 Your philosophy:
 • If an ingredient is synthetic, industrially processed, artificial, or ambiguous — it is a red flag.
-• You strongly favor whole, recognizable, minimally processed ingredients.
+• You strongly favor natural, recognizable, minimally processed ingredients.
 • You do NOT give manufacturers the benefit of the doubt.
 • You NEVER reclassify or soften ingredients already flagged by the chemical detection system.
-• "Natural flavor", "flavourings", E-numbers, dyes, modified starches, gums, emulsifiers, preservatives, or lab-derived compounds are treated as harmful unless explicitly whole-food derived.
+• "Natural flavor", "fragrances", "parfum", E-numbers, dyes, modified compounds, emulsifiers, preservatives, or lab-derived ingredients are treated as harmful unless explicitly natural/organic.
 
 Rules you MUST follow:
 1. If an ingredient matches a flagged chemical, you MUST mark it as harmful and explain why.
@@ -1204,7 +1144,7 @@ Rules you MUST follow:
 6. Favor short ingredient lists with recognizable whole foods.
 7. If unsure, err on the side of caution and flag it.
 
-Tone: Calm, grounded, honest, but uncompromising. You are a nutritionist who cares about real food, not industry profits.
+Tone: Calm, grounded, honest, but uncompromising. You are an ingredient auditor who cares about clean products, not industry profits.
 
 Output must be valid JSON only. Always use the exact chemical names provided as JSON keys without modification."""
                         },
@@ -1231,7 +1171,7 @@ Output must be valid JSON only. Always use the exact chemical names provided as 
                 for ing_name in harmful_ingredients:
                     harmful_descriptions[ing_name] = f"This ingredient has been flagged as potentially harmful. It may be synthetic, ultra-processed, or pose health and environmental risks."
         
-        # Generate safe ingredient descriptions with strict whole-food perspective
+        # Generate safe ingredient descriptions with strict clean product perspective
         safe_descriptions = {}
         if safe_ingredients:
             try:
@@ -1241,24 +1181,24 @@ Output must be valid JSON only. Always use the exact chemical names provided as 
                 ingredients_str = ", ".join(safe_ingredients)
                 logger.info(f"Generating descriptions for {len(safe_ingredients)} safe ingredients")
                 
-                safe_prompt = f"""Analyze these safe/common ingredients found in a consumer product from a whole-food nutrition perspective.
+                safe_prompt = f"""Analyze these safe/common ingredients found in a consumer product (food, beauty, cleaning, personal care) from a clean/natural product perspective.
 
 INGREDIENTS TO DESCRIBE:
 {ingredients_str}
 
 For each ingredient, provide a brief, educational description (1-2 sentences) that:
-1. Explains what the ingredient is (whole food vs processed vs synthetic)
-2. States its primary purpose/function in the product
-3. Offers a grounded nutritional perspective (is it beneficial, neutral, or concerning?)
+1. Explains what the ingredient is (natural vs processed vs synthetic)
+2. States its primary purpose/function in consumer products
+3. Offers a grounded perspective (is it beneficial, neutral, or concerning?)
 4. Mentions any processing concerns if it's refined/industrial
 
 Guidelines:
-• Be honest about ultra-processed ingredients (refined sugar, modified starches, industrial oils)
-• Don't give processed foods a free pass just because they're "safe"
-• Whole foods get positive descriptions, ultra-processed get honest critique
+• Be honest about ultra-processed ingredients (refined sugar, synthetic fragrances, harsh chemicals, industrial oils)
+• Don't give processed products a free pass just because they're "safe"
+• Natural ingredients get positive descriptions, ultra-processed get honest critique
 • Keep it educational, not alarmist
 
-Tone: Educational, honest, grounded in whole-food philosophy. Not alarmist, but don't sugarcoat industrial processing.
+Tone: Educational, honest, grounded in clean/natural product philosophy. Not alarmist, but don't sugarcoat industrial processing.
 
 Return ONLY valid JSON with ingredient names as keys and simple string descriptions as values:
 {{"Ingredient Name": "Brief 1-2 sentence description"}}
@@ -1270,13 +1210,13 @@ Ingredients: {ingredients_str}"""
                     messages=[
                         {
                             "role": "system", 
-                            "content": """You are a nutritionist analyzing ingredients with a whole-foods philosophy.
+                            "content": """You are an ingredient analyst for consumer products (food, beauty, cleaning, personal care) with a clean/natural product philosophy.
 
 Your perspective:
-• Whole, unprocessed foods = good
+• Natural, unprocessed ingredients = good
 • Refined, industrial, synthetic ingredients = problematic but honest
 • Ultra-processed ingredients deserve honest critique
-• Sugar is sugar - refined industrial sweeteners are concerning
+• Refined sweeteners, synthetic fragrances, harsh chemicals = concerning
 • If something can be natural or synthetic, assume synthetic unless stated
 
 Output ONLY valid JSON with ingredient names as keys and simple string descriptions as values.
@@ -1349,9 +1289,46 @@ def analyze_packaging_material(packaging_text: str, packaging_tags: list) -> dic
         
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
+        # STEP 1: First, quickly normalize/translate material names (FAST - minimal tokens)
+        normalize_prompt = f"""Extract and normalize the packaging material names from this text:
+
+{packaging_info}
+
+Return ONLY a JSON object with a "materials" array of clean, English material names.
+Translate non-English names to English. Use simple, clear names.
+
+Example input: "Plástico,Invólucro"
+Example output: {{"materials": ["Plastic", "Wrapper"]}}
+
+JSON only:"""
+
+        normalize_response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a packaging material expert. Return only JSON."},
+                {"role": "user", "content": normalize_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=100,
+            response_format={"type": "json_object"}
+        )
+        
+        normalize_content = normalize_response.choices[0].message.content.strip()
+        
+        # Parse normalized names
+        try:
+            normalized_data = json.loads(normalize_content)
+            normalized_materials = normalized_data.get("materials", packaging_tags if packaging_tags else [packaging_text])
+        except:
+            normalized_materials = packaging_tags if packaging_tags else [packaging_text]
+        
+        logger.info(f"Normalized material names: {normalized_materials}")
+        
+        # STEP 2: Now generate full descriptions (SLOW)
         prompt = f"""Analyze the following product packaging materials for health and environmental impact.
 
 Product: {packaging_info}
+Normalized materials: {', '.join(normalized_materials)}
 
 CRITICAL RULES:
 1. DO NOT use uncertainty phrases like "specific type unknown", "unknown", "unclear", "may contain", "could be"
@@ -1394,23 +1371,16 @@ Example (DON'T):
 
 Format as JSON:
 
-IMPORTANT: The material names in the "materials" array MUST EXACTLY MATCH the keys in the "analysis" object. Use the same format for both (lowercase with underscores, e.g., "plastic_bag", "stand_up_pouch", "cardboard_box").
+IMPORTANT: Use EXACTLY these normalized material names in both the "materials" array and as keys in "analysis": {json.dumps(normalized_materials)}
 
 {{
-    "materials": ["plastic_bag", "stand_up_pouch"],
+    "materials": {json.dumps(normalized_materials)},
     "analysis": {{
-        "plastic_bag": {{
+        "Material Name": {{
             "description": "detailed brand-specific description of how this material is used for this product, what it's made of, and why it's chosen",
             "harmful": true or false,
             "health_concerns": "specific health risks with definitive statements (no uncertainty)",
             "environmental_impact": "detailed environmental assessment with specific facts",
-            "severity": "low/moderate/high/critical"
-        }},
-        "stand_up_pouch": {{
-            "description": "...",
-            "harmful": true or false,
-            "health_concerns": "...",
-            "environmental_impact": "...",
             "severity": "low/moderate/high/critical"
         }}
     }},
@@ -1608,10 +1578,6 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
         
         logger.info(f"Extracted ingredients text: {ingredients_text[:200]}...")
         
-        # Parse ingredients including nested ones in parentheses/brackets
-        ingredients_list = parse_nested_ingredients(ingredients_text) if ingredients_text else []
-        logger.info(f"Parsed {len(ingredients_list)} ingredients (including nested)")
-        
         # === TRACK DATA SOURCES FOR METADATA ===
         ingredients_source = "openfacts" if ingredients_text else "none"
         packaging_source = "openfacts"
@@ -1640,34 +1606,21 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
                 inference_used = True
                 logger.info(f"AI inference added {len(inference_data['likely_ingredients'])} likely ingredients")
         
-        # === NORMALIZE INGREDIENTS FOR BETTER MATCHING ===
-        normalized_ingredients_text = normalize_ingredient_text(ingredients_text) if ingredients_text else ""
-        
-        # Parse ingredients and ensure all are strings
-        ingredients_list = []
-        for ing in ingredients_text.split(","):
-            ing = ing.strip()
-            if ing:
-                # Ensure it's a string (in case of any unexpected data types)
-                ingredients_list.append(str(ing))
-        
-        logger.info(f"Parsed {len(ingredients_list)} ingredients from text")
-        
-        # === USE AI-ONLY SEPARATION (NO PATTERN MATCHING) ===
-        # Directly use AI to separate ingredients into harmful vs safe
+        # === AI PARSING + SEPARATION ===
+        # Let AI parse and separate ingredients in one step
         harmful_ingredient_names = []
         safe_ingredient_names = []
         
-        if ingredients_list:
-            logger.info(f"Separating {len(ingredients_list)} ingredients with AI intelligent matching")
+        if ingredients_text and ingredients_text.strip():
+            logger.info(f"Parsing and separating ingredients with AI")
             
-            # Use AI to intelligently separate harmful vs safe (no pre-filtering with patterns)
-            separated = await separate_ingredients_with_ai(ingredients_list, [])  # Empty list - let AI decide everything
+            # Use AI to parse AND intelligently separate harmful vs safe
+            separated = await separate_ingredients_with_ai(ingredients_text, [])
             
             harmful_ingredient_names = separated.get("harmful", [])
             safe_ingredient_names = separated.get("safe", [])
             
-            logger.info(f"AI separation complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+            logger.info(f"AI parsing and separation complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
         
         # Build harmful chemicals list from AI separation
         # No need for safety score calculation - not used in frontend
@@ -1690,7 +1643,7 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
         }
         
         # Generate detailed AI ingredient descriptions (safe + harmful)
-        if ingredients_list:
+        if harmful_ingredient_names or safe_ingredient_names:
             # Generate detailed descriptions using AI-separated lists
             ingredient_descriptions = get_detailed_ingredient_descriptions(
                 safe_ingredients=safe_ingredient_names,
@@ -1986,13 +1939,6 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
                             if text:
                                 ingredient_texts.append(text)
                     ingredients_text = ", ".join(ingredient_texts)
-            
-            # Parse into list
-            if ingredients_text:
-                for ing in ingredients_text.split(","):
-                    ing = ing.strip()
-                    if ing:
-                        ingredients_list.append(str(ing))
         
         # AI INFERENCE if ingredients missing or minimal
         if not ingredients_text or len(ingredients_text.strip()) < 20:
@@ -2011,16 +1957,9 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
                 
                 ingredients_text = ingredients_text + ", " + inferred_ingredients if ingredients_text else inferred_ingredients
                 
-                # Re-parse
-                ingredients_list = []
-                for ing in ingredients_text.split(","):
-                    ing = ing.strip()
-                    if ing:
-                        ingredients_list.append(str(ing))
-                
                 logger.info(f"[INGREDIENTS-SEPARATE] AI inference added {len(inference_data['likely_ingredients'])} ingredients")
         
-        if not ingredients_list:
+        if not ingredients_text or not ingredients_text.strip():
             return {
                 'success': True,
                 'has_ingredients': False,
@@ -2029,14 +1968,16 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
                 'message': 'No ingredients found'
             }
         
-        # AI SEPARATION (FAST - only 1 AI call)
-        logger.info(f"[INGREDIENTS-SEPARATE] Separating {len(ingredients_list)} ingredients with AI")
-        separated = await separate_ingredients_with_ai(ingredients_list, [])
+        # AI PARSING + SEPARATION (FAST - only 1 AI call)
+        logger.info(f"[INGREDIENTS-SEPARATE] Parsing and separating ingredients with AI")
+        separated = await separate_ingredients_with_ai(ingredients_text, [])
         
         harmful_ingredient_names = separated.get("harmful", [])
         safe_ingredient_names = separated.get("safe", [])
         
         logger.info(f"[INGREDIENTS-SEPARATE] Complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+        
+        total_ingredients = len(harmful_ingredient_names) + len(safe_ingredient_names)
         
         return {
             'success': True,
@@ -2045,8 +1986,8 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
             'safe': safe_ingredient_names,
             'harmful_count': len(harmful_ingredient_names),
             'safe_count': len(safe_ingredient_names),
-            'total_count': len(ingredients_list),
-            'message': f'Separated {len(ingredients_list)} ingredients'
+            'total_count': total_ingredients,
+            'message': f'Parsed and separated {total_ingredients} ingredients'
         }
         
     except HTTPException:
@@ -2155,13 +2096,6 @@ async def analyze_ingredients(request: IngredientsAnalyzeRequest) -> Dict[str, A
                             if text:
                                 ingredient_texts.append(text)
                     ingredients_text = ", ".join(ingredient_texts)
-            
-            # Parse into list
-            if ingredients_text:
-                for ing in ingredients_text.split(","):
-                    ing = ing.strip()
-                    if ing:
-                        ingredients_list.append(str(ing))
         
         # AI INFERENCE if ingredients missing or minimal
         if not ingredients_text or len(ingredients_text.strip()) < 20:
@@ -2180,16 +2114,9 @@ async def analyze_ingredients(request: IngredientsAnalyzeRequest) -> Dict[str, A
                 
                 ingredients_text = ingredients_text + ", " + inferred_ingredients if ingredients_text else inferred_ingredients
                 
-                # Re-parse
-                ingredients_list = []
-                for ing in ingredients_text.split(","):
-                    ing = ing.strip()
-                    if ing:
-                        ingredients_list.append(str(ing))
-                
                 logger.info(f"[INGREDIENTS] AI inference added {len(inference_data['likely_ingredients'])} ingredients")
         
-        if not ingredients_list:
+        if not ingredients_text or not ingredients_text.strip():
             return {
                 'success': True,
                 'has_ingredients': False,
@@ -2199,9 +2126,9 @@ async def analyze_ingredients(request: IngredientsAnalyzeRequest) -> Dict[str, A
                 'message': 'No ingredients found for analysis'
             }
         
-        # AI SEPARATION
-        logger.info(f"[INGREDIENTS] Separating {len(ingredients_list)} ingredients with AI")
-        separated = await separate_ingredients_with_ai(ingredients_list, [])
+        # AI PARSING + SEPARATION
+        logger.info(f"[INGREDIENTS] Parsing and separating ingredients with AI")
+        separated = await separate_ingredients_with_ai(ingredients_text, [])
         
         harmful_ingredient_names = separated.get("harmful", [])
         safe_ingredient_names = separated.get("safe", [])
@@ -2224,6 +2151,8 @@ async def analyze_ingredients(request: IngredientsAnalyzeRequest) -> Dict[str, A
         
         logger.info(f"[INGREDIENTS] Analysis complete")
         
+        total_ingredients = len(harmful_ingredient_names) + len(safe_ingredient_names)
+        
         return {
             'success': True,
             'has_ingredients': True,
@@ -2232,7 +2161,7 @@ async def analyze_ingredients(request: IngredientsAnalyzeRequest) -> Dict[str, A
             'harmful_count': len(harmful_ingredient_names),
             'safe_count': len(safe_ingredient_names),
             'descriptions': ingredient_descriptions,
-            'message': f'Analyzed {len(ingredients_list)} ingredients'
+            'message': f'Analyzed {total_ingredients} ingredients'
         }
         
     except HTTPException:
@@ -2310,16 +2239,18 @@ async def separate_packaging(request: PackagingSeparateRequest) -> Dict[str, Any
             
             # Fallback to AI category-based inference
             category = product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General product"
-            packaging_inference = await infer_packaging_from_category(
+            packaging_materials = await infer_packaging_from_category(
                 product_name=product_data.get("name", "Unknown"),
                 category=category
             )
-            if packaging_inference:
-                packaging_text = packaging_inference
+            if packaging_materials:
+                # AI returns a list of materials directly
+                packaging_tags = packaging_materials
+                packaging_text = ", ".join(packaging_materials)
                 packaging_source = "ai_inferred"
-                logger.info(f"[PACKAGING-SEPARATE] Using AI-inferred packaging: {packaging_text}")
+                logger.info(f"[PACKAGING-SEPARATE] Using AI-inferred packaging: {packaging_materials}")
         
-        # Extract material names (simple parsing)
+        # Extract material names
         materials = []
         if packaging_tags:
             materials = packaging_tags
@@ -2332,7 +2263,7 @@ async def separate_packaging(request: PackagingSeparateRequest) -> Dict[str, Any
             if not materials:
                 materials = [packaging_text.strip()]
         
-        logger.info(f"[PACKAGING-SEPARATE] Extracted {len(materials)} materials")
+        logger.info(f"[PACKAGING-SEPARATE] Extracted {len(materials)} materials: {materials}")
         
         return {
             'success': True,
@@ -2369,7 +2300,10 @@ async def describe_packaging(request: PackagingDescribeRequest) -> Dict[str, Any
         if not barcode or not barcode.isdigit():
             raise HTTPException(status_code=400, detail="Invalid barcode")
         
-        logger.info(f"[PACKAGING-DESCRIBE] Analyzing {len(request.packaging_tags)} packaging materials")
+        # Extract material names FIRST from the tags (before AI processing)
+        material_names = request.packaging_tags if request.packaging_tags else []
+        
+        logger.info(f"[PACKAGING-DESCRIBE] Analyzing {len(material_names)} packaging materials: {material_names}")
         
         # ANALYZE PACKAGING (SLOW - 1 AI call)
         packaging_analysis = analyze_packaging_material(request.packaging_text, request.packaging_tags)
@@ -2607,7 +2541,7 @@ async def lookup_barcode_basic(request: BarcodeLookupRequest) -> Dict[str, Any]:
         basic_product = {
             "barcode": product_data.get("barcode", barcode),
             "name": product_data.get("name", "Unknown Product"),
-            "brand": product_data.get("brand", ""),
+            "brands": product_data.get("brands", ""),
             "categories": product_data.get("categories", ""),
             "image_url": product_data.get("image_url", ""),
             "source": product_data.get("source", ""),

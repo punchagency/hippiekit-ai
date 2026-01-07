@@ -169,7 +169,7 @@ class BarcodeService:
         normalized = {
             "barcode": product.get("code", ""),
             "name": product.get("product_name", "") or product.get("product_name_en", "Unknown Product"),
-            "brand": product.get("brands", ""),
+            "brands": product.get("brands", ""),
             "categories": product.get("categories", ""),
             "source": source,
             "image_url": self._get_best_image(product),
@@ -200,7 +200,7 @@ class BarcodeService:
             # Try web search for ingredients
             web_result = await self.web_search.search_product_ingredients(
                 product_name=normalized['name'],
-                brand=normalized['brand'],
+                brand=normalized['brands'],
                 category=normalized['categories'].split(',')[0] if normalized['categories'] else None
             )
             
