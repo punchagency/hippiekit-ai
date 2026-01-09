@@ -82,8 +82,8 @@ async def infer_ingredients_from_context(
     image_url: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Use AI to infer likely ingredients when OpenFacts data is missing or incomplete.
-    Returns educated guesses based on product type, category, and industry standards.
+    Use web search and AI to find actual product ingredients when OpenFacts data is missing.
+    Works for all consumer products: food, skincare, pet, kitchen, bathroom, etc.
     
     Args:
         product_name: Product name
@@ -92,66 +92,48 @@ async def infer_ingredients_from_context(
         image_url: Optional product image URL
         
     Returns:
-        Dictionary with inferred ingredients, packaging, and confidence level
+        Dictionary with actual ingredients found via web search (no additives/packaging/metadata)
+        Format: {"likely_ingredients": ["ingredient1", "ingredient2", ...]}
     """
     try:
-        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        # Import web search service
+        from services.web_search_service import web_search_service
         
-        prompt = f"""Based on this product information, provide an educated Fsis of likely ingredients and packaging.
-
-Product: {product_name}
-Brand: {brand or 'Unknown'}
-Category: {category or 'General consumer product'}
-
-Provide:
-1. Most likely ingredients for this product type (5-10 common ones)
-2. Potential harmful additives typically found in this category
-3. Typical packaging materials used for this product type
-4. Confidence level in these inferences
-
-Be realistic and conservative. Base your analysis on typical industry formulations.
-
-IMPORTANT: Return ONLY valid JSON in this exact format:
-{{
-  "likely_ingredients": ["ingredient1", "ingredient2", "ingredient3"],
-  "potential_additives": ["additive1", "additive2"],
-  "typical_packaging": ["plastic bottle", "cardboard box"],
-  "confidence": "medium",
-  "reasoning": "Brief explanation of why these ingredients are likely",
-  "disclaimer": "Analysis based on typical products in this category. Not confirmed ingredient list."
-}}"""
+        logger.info(f"[INGREDIENT INFERENCE] Searching web for: {brand} {product_name}")
         
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are an expert on consumer product formulations and ingredients. Provide realistic, conservative inferences based on industry standards. Always return valid JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=800
+        # Use web search to find actual ingredients
+        search_result = await web_search_service.search_product_ingredients(
+            product_name=product_name,
+            brand=brand,
+            category=category
         )
         
-        content = response.choices[0].message.content.strip()
+        if search_result and search_result.get('ingredients'):
+            # Parse the comma-separated ingredients into a list
+            ingredients_text = search_result['ingredients']
+            
+            # Split by comma and clean up each ingredient
+            ingredients_list = [
+                ing.strip() 
+                for ing in ingredients_text.split(',') 
+                if ing.strip()
+            ]
+            
+            logger.info(f"[INGREDIENT INFERENCE] Found {len(ingredients_list)} ingredients from {search_result.get('source', 'unknown source')}")
+            
+            return {
+                "likely_ingredients": ingredients_list
+            }
         
-        # Parse JSON response
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        inference_data = json.loads(content)
-        logger.info(f"AI inference successful for {product_name}")
-        return inference_data
+        logger.warning(f"[INGREDIENT INFERENCE] No ingredients found for {brand} {product_name}")
+        return {
+            "likely_ingredients": []
+        }
         
     except Exception as e:
-        logger.error(f"AI inference failed: {e}")
+        logger.error(f"[INGREDIENT INFERENCE] Failed: {e}")
         return {
-            "likely_ingredients": [],
-            "potential_additives": [],
-            "typical_packaging": [],
-            "confidence": "low",
-            "reasoning": "Unable to generate inference",
-            "disclaimer": "Insufficient data for analysis"
+            "likely_ingredients": []
         }
 
 
@@ -537,15 +519,26 @@ async def get_product_recommendations_for_barcode(
         image_embedding = None
         
         # Step 1: Generate text embedding (always try this first - most reliable)
-        category = ""
+        # Extract comprehensive product context for better embedding
+        categories_text = ""
         if product_data.get('categories'):
-            category = product_data['categories'].split(',')[0].strip()
+            # Handle both string and list formats
+            if isinstance(product_data['categories'], str):
+                categories_text = product_data['categories']
+            else:
+                categories_text = ', '.join(product_data['categories'])
         
         product_name = product_data.get('name', '')
         brand = product_data.get('brands', '')
-        text_query = f"{product_name} {brand} {category}".strip()
         
-        logger.info(f"Generating text embedding for: {text_query}")
+        # Optionally include product description/ingredients for richer context
+        product_description = product_data.get('ingredients_text', '')[:200]  # First 200 chars
+        
+        # Create rich text query combining multiple signals
+        # Format: "[Product Name] [Brand] [Categories] [Description snippet]"
+        text_query = f"{product_name} {brand} {categories_text} {product_description}".strip()
+        
+        logger.info(f"Generating text embedding for: {text_query[:150]}...")  # Truncate for logging
         text_embedding = clip_embedder.model.encode(text_query, convert_to_numpy=True)
         
         # Step 2: Try to get image embedding
@@ -580,9 +573,10 @@ async def get_product_recommendations_for_barcode(
         else:
             # Fallback to AI alternatives if no embeddings
             logger.warning("No embeddings available, using AI fallback")
+            primary_category = categories_text.split(',')[0].strip() if categories_text else ""
             ai_alternatives = await generate_ai_product_alternatives(
                 product_name=product_name,
-                category=category,
+                category=primary_category,
                 count=3
             )
             return {
@@ -605,9 +599,10 @@ async def get_product_recommendations_for_barcode(
         
         if not candidates:
             # No candidates at all - use AI fallback
+            primary_category = categories_text.split(',')[0].strip() if categories_text else ""
             ai_alternatives = await generate_ai_product_alternatives(
                 product_name=product_name,
-                category=category,
+                category=primary_category,
                 count=3
             )
             return {
@@ -619,9 +614,10 @@ async def get_product_recommendations_for_barcode(
             }
         
         # Step 5: AI-powered relevance filtering
+        primary_category = categories_text.split(',')[0].strip() if categories_text else ""
         relevant_products = await filter_relevant_products(
             scanned_product_name=product_name,
-            scanned_category=category,
+            scanned_category=primary_category,
             candidate_products=candidates,
             min_relevance_score=7  # Out of 10
         )
@@ -641,9 +637,10 @@ async def get_product_recommendations_for_barcode(
         
         elif len(relevant_products) == 1:
             # Partial: Found some but supplement with AI
+            primary_category = categories_text.split(',')[0].strip() if categories_text else ""
             ai_alternatives = await generate_ai_product_alternatives(
                 product_name=product_name,
-                category=category,
+                category=primary_category,
                 count=2
             )
             return {
@@ -656,9 +653,10 @@ async def get_product_recommendations_for_barcode(
         
         else:
             # No relevant products - full AI fallback
+            primary_category = categories_text.split(',')[0].strip() if categories_text else ""
             ai_alternatives = await generate_ai_product_alternatives(
                 product_name=product_name,
-                category=category,
+                category=primary_category,
                 count=3
             )
             return {
@@ -724,9 +722,9 @@ async def filter_relevant_products(
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
-        # Prepare candidate list for AI
+        # Prepare candidate list for AI with enhanced metadata (categories + description)
         candidates_text = "\n".join([
-            f"{i+1}. {p.get('name', 'Unknown')} (Category: {p.get('description', 'N/A')[:100]})"
+            f"{i+1}. {p.get('name', 'Unknown')} | Categories: {p.get('categories', 'N/A')} | {p.get('description', 'N/A')[:150]}..."
             for i, p in enumerate(candidate_products)
         ])
         
@@ -735,7 +733,7 @@ async def filter_relevant_products(
 Scanned Product: "{scanned_product_name}"
 Category: "{scanned_category}"
 
-Candidate Recommendations:
+Candidate Recommendations (with categories & descriptions):
 {candidates_text}
 
 Task: Rate each candidate's RELEVANCE as a healthier alternative (1-10 scale):
@@ -749,6 +747,8 @@ Examples:
 - Scanned "Skittles candy" → Recommend "Organic chocolate" (score: 8) 
 - Scanned "Skittles candy" → Recommend "Reusable straw" (score: 1)
 - Scanned "Skittles candy" → Recommend "Mattress topper" (score: 1)
+
+IMPORTANT: Use the categories and descriptions provided to make accurate relevance judgments.
 
 Return ONLY a JSON array of relevance scores (1-10) for each candidate in order:
 [10, 8, 1, 1, ...]
@@ -870,7 +870,7 @@ Now generate {count} alternatives for "{product_name}" (category: {category}):""
                 {"role": "system", "content": "You are a health and eco-conscious product expert specializing in clean/natural alternatives across all consumer product categories (food, beauty, cleaning, personal care). You recommend specific real brands and products."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.7,
+            temperature=0.1,
             max_tokens=800
         )
         
@@ -1254,10 +1254,27 @@ Example: {"Sugar": "Refined white sugar is an ultra-processed sweetener that spi
         return {"safe": {}, "harmful": {}}
 
 
-def analyze_packaging_material(packaging_text: str, packaging_tags: list) -> dict:
+def analyze_packaging_material(
+    packaging_text: str, 
+    packaging_tags: list, 
+    normalized_materials: list = None,
+    brand_name: str = None,
+    product_name: str = None,
+    categories: str = None,
+    food_contact: bool = None
+) -> dict:
     """
     Analyze packaging materials for environmental and health impact.
     Considers: plastic types (BPA, microplastics), recyclability, environmental impact
+    
+    Args:
+        packaging_text: Raw packaging text from product data
+        packaging_tags: Raw packaging tags from product data
+        normalized_materials: Pre-normalized material names from /separate route (RECOMMENDED)
+        brand_name: Product brand name for context
+        product_name: Product name for context
+        categories: Product categories for context
+        food_contact: Whether packaging has direct food contact
     
     Returns:
         {
@@ -1276,7 +1293,7 @@ def analyze_packaging_material(packaging_text: str, packaging_tags: list) -> dic
         }
     """
     try:
-        if not packaging_text and not packaging_tags:
+        if not packaging_text and not packaging_tags and not normalized_materials:
             return {
                 "materials": [],
                 "analysis": {},
@@ -1284,69 +1301,72 @@ def analyze_packaging_material(packaging_text: str, packaging_tags: list) -> dic
                 "summary": "No packaging information available"
             }
         
-        # Combine packaging info
+        # Use pre-normalized materials from /separate route if provided
+        if normalized_materials:
+            logger.info(f"Using pre-normalized material names: {normalized_materials}")
+        else:
+            # Fallback to packaging tags if no normalized materials provided
+            normalized_materials = packaging_tags if packaging_tags else [packaging_text]
+            logger.warning(f"No normalized materials provided, using fallback: {normalized_materials}")
+        
+        # Combine packaging info for context
         packaging_info = f"Packaging: {packaging_text}. Tags: {', '.join(packaging_tags)}" if packaging_tags else packaging_text
         
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
-        # STEP 1: First, quickly normalize/translate material names (FAST - minimal tokens)
-        normalize_prompt = f"""Extract and normalize the packaging material names from this text:
-
-{packaging_info}
-
-Return ONLY a JSON object with a "materials" array of clean, English material names.
-Translate non-English names to English. Use simple, clear names.
-
-Example input: "Plástico,Invólucro"
-Example output: {{"materials": ["Plastic", "Wrapper"]}}
-
-JSON only:"""
-
-        normalize_response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a packaging material expert. Return only JSON."},
-                {"role": "user", "content": normalize_prompt}
-            ],
-            temperature=0.1,
-            max_tokens=100,
-            response_format={"type": "json_object"}
-        )
+        # Build product context string
+        context_parts = []
+        if brand_name:
+            context_parts.append(f"Brand: {brand_name}")
+        if product_name:
+            context_parts.append(f"Product: {product_name}")
+        if categories:
+            # Use first category for simplicity
+            main_category = categories.split(",")[0].strip() if "," in categories else categories
+            context_parts.append(f"Category: {main_category}")
+        if food_contact is not None:
+            contact_status = "YES - direct food contact" if food_contact else "NO - no direct food contact"
+            context_parts.append(f"Food Contact: {contact_status}")
         
-        normalize_content = normalize_response.choices[0].message.content.strip()
+        product_context = "\n".join(context_parts) if context_parts else "Product context not available"
         
-        # Parse normalized names
-        try:
-            normalized_data = json.loads(normalize_content)
-            normalized_materials = normalized_data.get("materials", packaging_tags if packaging_tags else [packaging_text])
-        except:
-            normalized_materials = packaging_tags if packaging_tags else [packaging_text]
+        logger.info(f"[PACKAGING-ANALYZE] Building context from parameters:")
+        logger.info(f"  - brand_name param: '{brand_name}'")
+        logger.info(f"  - product_name param: '{product_name}'")
+        logger.info(f"  - categories param: '{categories}'")
+        logger.info(f"  - food_contact param: {food_contact}")
+        logger.info(f"[PACKAGING-ANALYZE] Final product context:\n{product_context}")
         
-        logger.info(f"Normalized material names: {normalized_materials}")
-        
-        # STEP 2: Now generate full descriptions (SLOW)
+        # Generate full descriptions for normalized materials
         prompt = f"""Analyze the following product packaging materials for health and environmental impact.
 
-Product: {packaging_info}
+PRODUCT CONTEXT:
+{product_context}
+
+PACKAGING INFO:
+{packaging_info}
 Normalized materials: {', '.join(normalized_materials)}
 
 CRITICAL RULES:
 1. DO NOT use uncertainty phrases like "specific type unknown", "unknown", "unclear", "may contain", "could be"
 2. Each packaging material gets its own complete, detailed analysis
-3. Describe how THIS BRAND uses THIS SPECIFIC material for THIS PRODUCT
-4. Be authoritative and fact-based
+3. USE THE PRODUCT CONTEXT (brand, product name, category, food contact status) to provide specific analysis
+4. If food contact is YES, emphasize health risks from leaching and chemical migration
+5. If product context is missing, intelligently infer based on packaging materials and common usage patterns
+6. Be authoritative and fact-based
 
 For EACH packaging material, provide:
 
 **Description**: 
-- How this brand uses this material for this product (e.g., "The brand packages this product in a flexible stand-up pouch with resealable zipper for convenient storage")
+- How this specific brand uses this material for this product (reference brand name and product if available)
+- For food contact packaging: mention direct contact with food and migration risks
 - What this material is made of and its properties
-- Why manufacturers choose this packaging type
+- Why manufacturers in this category choose this packaging type
 
 **Health Concerns**:
+- If food contact: emphasize chemical leaching into food, migration of additives
 - Specific chemicals and additives present in this material type
-- Leaching risks and food contact concerns
-- Microplastic generation
+- Microplastic generation and ingestion risks
 - Endocrine disruptors or toxins
 - State definitive risks, not possibilities
 
@@ -1361,12 +1381,12 @@ For EACH packaging material, provide:
 - Severity: low/moderate/high/critical
 - Overall harmful: true/false
 
-TONE: Authoritative, specific to this brand and product. State facts definitively.
+TONE: Authoritative, specific to this brand and product. Use product context to provide detailed analysis.
 
-Example (DO):
-"The brand packages this licorice in a flexible plastic stand-up pouch with resealable zipper. This multi-layer plastic typically contains polyethylene and polypropylene layers bonded together. Manufacturers choose this format for shelf stability and consumer convenience."
+Example with context (DO):
+"Cadbury packages this Dairy Milk chocolate bar in a flexible plastic wrapper with direct food contact. This multi-layer plastic film typically contains polyethylene and polypropylene layers bonded together for moisture protection. For chocolate products, manufacturers choose this format to prevent oxidation and maintain freshness while allowing easy unwrapping."
 
-Example (DON'T):
+Example without context (DON'T):
 "Stand-up pouches are commonly used for snacks."
 
 Format as JSON:
@@ -1388,6 +1408,9 @@ IMPORTANT: Use EXACTLY these normalized material names in both the "materials" a
     "summary": "authoritative 2-3 sentence assessment of the overall packaging"
 }}
 """
+        
+        # Log the full prompt for debugging
+        logger.info(f"[PACKAGING-ANALYZE] Full prompt being sent to OpenAI:\n{prompt}")
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -1598,9 +1621,6 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
             if inference_data and inference_data.get("likely_ingredients"):
                 # Combine inferred ingredients with any existing data
                 inferred_ingredients = ", ".join(inference_data["likely_ingredients"])
-                if inference_data.get("potential_additives"):
-                    inferred_ingredients += ", " + ", ".join(inference_data["potential_additives"])
-                
                 ingredients_text = ingredients_text + ", " + inferred_ingredients if ingredients_text else inferred_ingredients
                 ingredients_source = "ai_inferred"
                 inference_used = True
@@ -1689,13 +1709,7 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
                 packaging_source = "web_search"
                 logger.info(f"Using web-searched packaging: {packaging_text}")
             
-            # Strategy 2: Use AI inference from earlier if available
-            elif inference_data and inference_data.get("typical_packaging"):
-                packaging_text = ", ".join(inference_data["typical_packaging"])
-                packaging_source = "ai_inferred"
-                logger.info(f"Using AI-inferred packaging: {packaging_text}")
-            
-            # Strategy 3: AI inference based on category (always provide something)
+            # Strategy 2: AI inference based on category (always provide something)
             else:
                 category = product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General product"
                 packaging_inference = await infer_packaging_from_category(
@@ -1750,10 +1764,6 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
             confidence_level = "medium"
         else:
             confidence_level = "low"
-        
-        # Add inference disclaimer if used
-        if inference_used and inference_data:
-            disclaimers.append(inference_data.get("disclaimer", ""))
         
         product_data["analysis_metadata"] = {
             "ingredients_source": ingredients_source,
@@ -1952,9 +1962,6 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
             
             if inference_data and inference_data.get("likely_ingredients"):
                 inferred_ingredients = ", ".join(inference_data["likely_ingredients"])
-                if inference_data.get("potential_additives"):
-                    inferred_ingredients += ", " + ", ".join(inference_data["potential_additives"])
-                
                 ingredients_text = ingredients_text + ", " + inferred_ingredients if ingredients_text else inferred_ingredients
                 
                 logger.info(f"[INGREDIENTS-SEPARATE] AI inference added {len(inference_data['likely_ingredients'])} ingredients")
@@ -2109,9 +2116,6 @@ async def analyze_ingredients(request: IngredientsAnalyzeRequest) -> Dict[str, A
             
             if inference_data and inference_data.get("likely_ingredients"):
                 inferred_ingredients = ", ".join(inference_data["likely_ingredients"])
-                if inference_data.get("potential_additives"):
-                    inferred_ingredients += ", " + ", ".join(inference_data["potential_additives"])
-                
                 ingredients_text = ingredients_text + ", " + inferred_ingredients if ingredients_text else inferred_ingredients
                 
                 logger.info(f"[INGREDIENTS] AI inference added {len(inference_data['likely_ingredients'])} ingredients")
@@ -2188,6 +2192,22 @@ class PackagingDescribeRequest(BaseModel):
     barcode: str
     packaging_text: str
     packaging_tags: list[str]
+    normalized_materials: Optional[list[str]] = None  # Pre-normalized materials from /separate route
+    brand_name: Optional[str] = None
+    product_name: Optional[str] = None
+    categories: Optional[str] = None
+    categories_tags: Optional[list[str]] = None
+    food_contact: Optional[bool] = None
+    packagings_data: Optional[list] = None
+
+
+def normalize_none_string(value: any) -> any:
+    """Convert string 'None' to actual None, and strip empty strings to None"""
+    if value == "None" or value == "null" or value == "undefined":
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    return value
 
 
 @router.post("/barcode/packaging/separate")
@@ -2265,14 +2285,91 @@ async def separate_packaging(request: PackagingSeparateRequest) -> Dict[str, Any
         
         logger.info(f"[PACKAGING-SEPARATE] Extracted {len(materials)} materials: {materials}")
         
+        # EXTRACT PRODUCT CONTEXT for detailed analysis
+        # Note: OpenFacts may return empty strings, so we convert them to None
+        brand_name = product_data.get("brands", "").strip() or None
+        categories = product_data.get("categories", "").strip() or None
+        categories_tags = product_data.get("categories_tags", [])
+        product_name = (product_data.get("product_name", "").strip() or 
+                       product_data.get("name", "").strip() or None)
+        
+        # Extract food contact info from packagings array
+        food_contact = None
+        packagings_data = product_data.get("packagings", [])
+        if packagings_data and isinstance(packagings_data, list):
+            # Check if any packaging has food contact
+            for pkg in packagings_data:
+                if pkg.get("food_contact") == 1:
+                    food_contact = True
+                    break
+        
+        logger.info(f"[PACKAGING-SEPARATE] Product context extracted:")
+        logger.info(f"  - Brand: '{brand_name}'")
+        logger.info(f"  - Product: '{product_name}'")
+        logger.info(f"  - Categories: '{categories}'")
+        logger.info(f"  - Food contact: {food_contact}")
+        logger.info(f"  - Packagings data count: {len(packagings_data) if packagings_data else 0}")
+        
+        # NORMALIZE MATERIAL NAMES WITH AI (FAST - minimal tokens)
+        normalized_materials = materials  # fallback
+        if materials:
+            try:
+                packaging_info = f"Packaging: {packaging_text}. Tags: {', '.join(packaging_tags)}" if packaging_tags else packaging_text
+                client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+                
+                normalize_prompt = f"""Extract and normalize the packaging material names from this text:
+
+{packaging_info}
+
+Return ONLY a JSON object with a "materials" array of clean, English material names.
+Translate non-English names to English. Use simple, clear names.
+
+Example input: "Plástico,Invólucro"
+Example output: {{"materials": ["Plastic", "Wrapper"]}}
+
+JSON only:"""
+
+                normalize_response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are a packaging material expert. Return only JSON."},
+                        {"role": "user", "content": normalize_prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=100,
+                    response_format={"type": "json_object"}
+                )
+                
+                normalize_content = normalize_response.choices[0].message.content.strip()
+                
+                # Parse normalized names
+                try:
+                    normalized_data = json.loads(normalize_content)
+                    normalized_materials = normalized_data.get("materials", materials)
+                    logger.info(f"[PACKAGING-SEPARATE] Normalized material names: {normalized_materials}")
+                except:
+                    logger.warning(f"[PACKAGING-SEPARATE] Failed to parse normalized materials, using original")
+                    normalized_materials = materials
+            except Exception as e:
+                logger.error(f"[PACKAGING-SEPARATE] Error normalizing materials: {e}")
+                normalized_materials = materials
+        
         return {
             'success': True,
-            'has_packaging_data': len(materials) > 0,
-            'materials': materials,
+            'has_packaging_data': len(normalized_materials) > 0,
+            'materials': normalized_materials,
             'packaging_text': packaging_text,
             'packaging_tags': packaging_tags,
             'source': packaging_source,
-            'message': f'Extracted {len(materials)} packaging materials'
+            'product_context': {
+                'brand_name': brand_name,
+                'product_name': product_name,
+                'categories': categories,
+                'categories_tags': categories_tags,
+                'food_contact': food_contact,
+                'packagings_data': packagings_data
+            },
+            'message': f'Extracted {len(normalized_materials)} packaging materials'
         }
         
     except HTTPException:
@@ -2289,7 +2386,7 @@ async def describe_packaging(request: PackagingDescribeRequest) -> Dict[str, Any
     Takes 3-5 seconds. Call after /separate to get detailed descriptions.
     
     Args:
-        request: Contains packaging text and tags
+        request: Contains packaging text, tags, and normalized_materials from /separate
         
     Returns:
         Detailed AI-generated analysis for each material
@@ -2300,13 +2397,32 @@ async def describe_packaging(request: PackagingDescribeRequest) -> Dict[str, Any
         if not barcode or not barcode.isdigit():
             raise HTTPException(status_code=400, detail="Invalid barcode")
         
-        # Extract material names FIRST from the tags (before AI processing)
-        material_names = request.packaging_tags if request.packaging_tags else []
+        # Use normalized materials from /separate route (for consistency)
+        normalized_materials = request.normalized_materials or request.packaging_tags or []
         
-        logger.info(f"[PACKAGING-DESCRIBE] Analyzing {len(material_names)} packaging materials: {material_names}")
+        # Clean up string 'None' values that might come from frontend
+        brand_name = normalize_none_string(request.brand_name)
+        product_name = normalize_none_string(request.product_name)
+        categories = normalize_none_string(request.categories)
+        food_contact = request.food_contact if request.food_contact is not None else None
         
-        # ANALYZE PACKAGING (SLOW - 1 AI call)
-        packaging_analysis = analyze_packaging_material(request.packaging_text, request.packaging_tags)
+        logger.info(f"[PACKAGING-DESCRIBE] Analyzing {len(normalized_materials)} packaging materials: {normalized_materials}")
+        logger.info(f"[PACKAGING-DESCRIBE] Received product context (after cleanup):")
+        logger.info(f"  - Brand: {repr(brand_name)}")
+        logger.info(f"  - Product: {repr(product_name)}")
+        logger.info(f"  - Categories: {repr(categories)}")
+        logger.info(f"  - Food contact: {food_contact}")
+        
+        # ANALYZE PACKAGING with pre-normalized materials and product context (SLOW - 1 AI call)
+        packaging_analysis = analyze_packaging_material(
+            request.packaging_text, 
+            request.packaging_tags,
+            normalized_materials=normalized_materials,
+            brand_name=brand_name,
+            product_name=product_name,
+            categories=categories,
+            food_contact=food_contact
+        )
         
         logger.info(f"[PACKAGING-DESCRIBE] Analysis complete")
         

@@ -64,14 +64,16 @@ class PineconeService:
             product_id = str(product.get('id'))
             embedding = embeddings[i].tolist()
             
-            # Metadata to store with the vector
+            # Metadata to store with the vector (optimized for search & display)
             metadata = {
                 'product_id': product_id,
                 'name': product.get('name', ''),
                 'price': product.get('price', ''),
                 'image_url': product.get('image_url', ''),
                 'permalink': product.get('permalink', ''),
-                'description': product.get('description', '')[:500]  # Limit description length
+                'description': product.get('description', ''),  # Already trimmed to 100-200 words
+                'categories': ', '.join(product.get('categories', [])),  # Category names as comma-separated string
+                'affiliate_url': product.get('affiliate_url', '')
             }
             
             vectors.append({
@@ -127,6 +129,8 @@ class PineconeService:
                     'image_url': match.metadata.get('image_url'),
                     'permalink': match.metadata.get('permalink'),
                     'description': match.metadata.get('description'),
+                    'categories': match.metadata.get('categories', ''),
+                    'affiliate_url': match.metadata.get('affiliate_url', ''),
                     'similarity_score': float(match.score)
                 }
                 products.append(product)

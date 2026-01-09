@@ -2,6 +2,8 @@ import requests
 from typing import List, Dict, Any, Optional
 import os
 import time
+import html
+from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -35,6 +37,51 @@ class WordPressService:
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
+        
+        # Cache for product categories (ID -> name mapping)
+        self.categories_cache = {}
+        self._fetch_all_categories()
+
+    def _fetch_all_categories(self):
+        """
+        Fetch all product categories from WordPress API and cache them.
+        This is called once during initialization to avoid repeated API calls.
+        """
+        try:
+            categories_url = f"{self.base_url}/wp-json/wp/v2/product-categories"
+            print(f"Fetching product categories...")
+            
+            page = 1
+            per_page = 100
+            
+            while True:
+                response = self.session.get(
+                    categories_url,
+                    params={'page': page, 'per_page': per_page},
+                    timeout=30
+                )
+                response.raise_for_status()
+                batch = response.json()
+                
+                if not batch:
+                    break
+                
+                # Add categories to cache
+                for category in batch:
+                    self.categories_cache[category['id']] = category['name']
+                
+                # Check if there are more pages
+                total_pages = int(response.headers.get('X-WP-TotalPages', page))
+                if page >= total_pages:
+                    break
+                
+                page += 1
+            
+            print(f"✅ Cached {len(self.categories_cache)} product categories")
+            
+        except Exception as e:
+            print(f"⚠️ Warning: Could not fetch categories: {e}")
+            print(f"   Continuing without category data...")
 
     def fetch_products(self, max_products: Optional[int] = None) -> List[Dict[str, Any]]:
         """
@@ -171,15 +218,40 @@ class WordPressService:
             title = product.get('title', {})
             if isinstance(title, dict):
                 title = title.get('rendered', '')
+            # Decode HTML entities in title
+            title = html.unescape(title)
 
-            # Extract description
-            description = product.get('excerpt', {})
-            if isinstance(description, dict):
-                description = description.get('rendered', '')
+            # Extract FULL description from content (not excerpt)
+            content = product.get('content', {})
+            if isinstance(content, dict):
+                description_html = content.get('rendered', '')
+            else:
+                description_html = ''
 
-            # Clean HTML from description
-            import re
-            description = re.sub('<[^<]+?>', '', description).strip()
+            # Clean HTML using BeautifulSoup and decode entities
+            if description_html:
+                soup = BeautifulSoup(description_html, 'html.parser')
+                description = soup.get_text(separator=' ', strip=True)
+                # Decode HTML entities (like &#038; -> &)
+                description = html.unescape(description)
+            else:
+                description = ''
+            
+            # Trim description to 100-200 words for embedding
+            words = description.split()
+            if len(words) > 200:
+                description = ' '.join(words[:200]) + '...'
+            
+            # Extract category names from category IDs
+            category_ids = product.get('product-categories', [])
+            categories = [
+                self.categories_cache.get(cat_id, f"Category-{cat_id}")
+                for cat_id in category_ids
+            ]
+
+            # Extract affiliate URL from meta
+            meta = product.get('meta', {})
+            affiliate_url = meta.get('cta_button_url', '')
 
             # Get price (if available)
             price = product.get('price', product.get('regular_price', ''))
@@ -190,7 +262,9 @@ class WordPressService:
                 'price': price,
                 'image_url': image_url,
                 'permalink': product.get('link', ''),
-                'description': description
+                'description': description,
+                'categories': categories,
+                'affiliate_url': affiliate_url
             }
 
         except Exception as e:
