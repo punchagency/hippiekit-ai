@@ -23,6 +23,7 @@ class BarcodeService:
     OPENFOODFACTS_API = "https://world.openfoodfacts.org/api/v2/product/{barcode}"
     OPENBEAUTYFACTS_API = "https://world.openbeautyfacts.org/api/v2/product/{barcode}"
     OPENPRODUCTSFACTS_API = "https://world.openproductsfacts.org/api/v2/product/{barcode}"  # Note: productSfacts with 's'
+    UPCITEMDB_API = "https://api.upcitemdb.com/prod/trial/lookup?upc={barcode}"
     
     def __init__(self):
         self.timeout = 10  # seconds
@@ -71,6 +72,7 @@ class BarcodeService:
             ("OpenFoodFacts", self.OPENFOODFACTS_API.format(barcode=barcode)),
             ("OpenBeautyFacts", self.OPENBEAUTYFACTS_API.format(barcode=barcode)),
             ("OpenProductsFacts", self.OPENPRODUCTSFACTS_API.format(barcode=barcode)),
+            ("UPCItemDB", self.UPCITEMDB_API.format(barcode=barcode)),
         ]
         
         # Create parallel tasks for all databases
@@ -115,8 +117,13 @@ class BarcodeService:
                 async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=self.timeout)) as response:
                     if response.status == 200:
                         data = await response.json()
-                        # Check if product was found
-                        if data.get("status") == 1 and data.get("product"):
+                        
+                        # Handle UPCItemDB API response format
+                        if db_name == "UPCItemDB":
+                            if data.get("code") == "OK" and data.get("items") and len(data["items"]) > 0:
+                                return (db_name, data["items"][0])
+                        # Handle Open*Facts API response format
+                        elif data.get("status") == 1 and data.get("product"):
                             return (db_name, data["product"])
             
             return (db_name, None)
@@ -165,29 +172,57 @@ class BarcodeService:
         Returns:
             Normalized product dictionary with chemical analysis
         """
-        # Extract common fields
-        normalized = {
-            "barcode": product.get("code", ""),
-            "name": product.get("product_name", "") or product.get("product_name_en", "Unknown Product"),
-            "brands": product.get("brands", ""),
-            "categories": product.get("categories", ""),
-            "source": source,
-            "image_url": self._get_best_image(product),
-            "ingredients": self._extract_ingredients(product),
-            "materials": self._extract_materials(product),
-            "nutrition": self._extract_nutrition(product),
-            "labels": product.get("labels", ""),
-            "packaging": product.get("packaging", ""),
-            "quantity": product.get("quantity", ""),
-            "countries": product.get("countries", ""),
-            "url": product.get("url", ""),
-        }
-        
-        # === Get ingredients text for chemical checking ===
-        ingredients_text = (
-            product.get("ingredients_text", "") or 
-            product.get("ingredients_text_en", "")
-        )
+        # Handle UPCItemDB API format
+        if source == "UPCItemDB":
+            normalized = {
+                "barcode": product.get("ean", ""),
+                "name": product.get("title", "Unknown Product"),
+                "brands": product.get("brand", ""),
+                "categories": product.get("category", ""),
+                "source": source,
+                "image_url": product.get("images", [""])[0] if product.get("images") else "",
+                "ingredients": [],
+                "materials": {},
+                "nutrition": {},
+                "labels": "",
+                "packaging": "",
+                "quantity": product.get("size", ""),
+                "countries": "",
+                "url": "",
+                "description": product.get("description", ""),
+                "asin": product.get("asin", ""),
+                "model": product.get("model", ""),
+                "color": product.get("color", ""),
+                "dimension": product.get("dimension", ""),
+                "weight": product.get("weight", ""),
+                "lowest_price": product.get("lowest_recorded_price"),
+                "highest_price": product.get("highest_recorded_price"),
+            }
+            ingredients_text = ""
+        else:
+            # Extract common fields for Open*Facts APIs
+            normalized = {
+                "barcode": product.get("code", ""),
+                "name": product.get("product_name", "") or product.get("product_name_en", "Unknown Product"),
+                "brands": product.get("brands", ""),
+                "categories": product.get("categories", ""),
+                "source": source,
+                "image_url": self._get_best_image(product),
+                "ingredients": self._extract_ingredients(product),
+                "materials": self._extract_materials(product),
+                "nutrition": self._extract_nutrition(product),
+                "labels": product.get("labels", ""),
+                "packaging": product.get("packaging", ""),
+                "quantity": product.get("quantity", ""),
+                "countries": product.get("countries", ""),
+                "url": product.get("url", ""),
+            }
+            
+            # === Get ingredients text for chemical checking ===
+            ingredients_text = (
+                product.get("ingredients_text", "") or 
+                product.get("ingredients_text_en", "")
+            )
         
         # === NEW: Web Search Fallback if ingredients empty ===
         data_source = "database"
