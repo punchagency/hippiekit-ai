@@ -5,6 +5,8 @@ Based on Hippiekit's comprehensive toxin database
 
 from typing import List, Dict, Any, Set
 import re
+import os
+from pathlib import Path
 
 
 # Severity levels
@@ -505,3 +507,47 @@ if __name__ == "__main__":
     print("\n🏆 TRUSTED CERTIFICATIONS:")
     for item in recs["certifications"]:
         print(f"  - {item}")
+
+
+# ========== LOAD COMPREHENSIVE CHEMICAL DATABASE FROM FILE ==========
+
+# Cache for the loaded chemical database
+_HARMFUL_CHEMICALS_TEXT_CACHE = None
+
+def load_harmful_chemicals_db() -> str:
+    """
+    Load the comprehensive harmful chemicals list from list_of_chemicals.txt.
+    This is cached in memory after first load for performance.
+    
+    Returns:
+        Full text content of the chemical database for AI prompt injection
+    """
+    global _HARMFUL_CHEMICALS_TEXT_CACHE
+    
+    # Return cached version if already loaded
+    if _HARMFUL_CHEMICALS_TEXT_CACHE is not None:
+        return _HARMFUL_CHEMICALS_TEXT_CACHE
+    
+    try:
+        # Get path to list_of_chemicals.txt (same directory as this file's parent)
+        current_dir = Path(__file__).parent.parent
+        chemicals_file = current_dir / "list_of_chemicals.txt"
+        
+        if not chemicals_file.exists():
+            # Fallback: try relative path
+            chemicals_file = Path("list_of_chemicals.txt")
+        
+        if not chemicals_file.exists():
+            raise FileNotFoundError(f"Could not find list_of_chemicals.txt at {chemicals_file}")
+        
+        # Load and cache the file content
+        with open(chemicals_file, 'r', encoding='utf-8') as f:
+            _HARMFUL_CHEMICALS_TEXT_CACHE = f.read()
+        
+        print(f"[CHEMICAL-DB] Loaded {len(_HARMFUL_CHEMICALS_TEXT_CACHE)} characters from {chemicals_file}")
+        return _HARMFUL_CHEMICALS_TEXT_CACHE
+        
+    except Exception as e:
+        print(f"[CHEMICAL-DB] Error loading harmful chemicals database: {e}")
+        # Return empty string as fallback
+        return ""

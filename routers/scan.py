@@ -18,7 +18,7 @@ from models import get_clip_embedder
 from services import get_pinecone_service
 from services.barcode_service import get_barcode_service
 from services.vision_service import get_vision_service
-from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations
+from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations, load_harmful_chemicals_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -921,7 +921,7 @@ async def separate_ingredients_with_ai(
     The AI will:
     1. Parse the raw ingredients text (handling parentheses, nested ingredients, etc.)
     2. Extract individual ingredients correctly
-    3. Categorize each as harmful or safe based on clean/natural product principles
+    3. Categorize each as harmful or safe based on curated harmful chemicals database
     
     Args:
         ingredients_text: Raw ingredients text from product label (unparsed)
@@ -941,95 +941,90 @@ async def separate_ingredients_with_ai(
         
         logger.info(f"Raw ingredients text: {ingredients_text[:200]}...")
         
+        # Load the comprehensive harmful chemicals database from file (cached)
+        harmful_chemicals_text = load_harmful_chemicals_db()
+        
         # STEP 1: Create prompt for AI to PARSE AND CATEGORIZE in one step
-        prompt = f"""
-You are a STRICT hippie/health-obsessed ingredient reviewer. Be EXTREMELY strict.
+        prompt = f"""You are a health-conscious ingredient reviewer analyzing product ingredients.
 
 RAW INGREDIENT TEXT FROM PRODUCT LABEL:
 {ingredients_text}
 
 TASKS:
-1. PARSE correctly - extract ALL ingredients including nested ones in parentheses
-   Example: "Milk Chocolate (sugar, cocoa butter, soy lecithin)" extracts:
-   Milk Chocolate, sugar, cocoa butter, soy lecithin
+1. PARSE the ingredients correctly - extract ALL individual ingredients including nested ones in parentheses
+   Example: "Milk Chocolate (sugar, cocoa butter, soy lecithin)" extracts 4 ingredients:
+   - Milk Chocolate
+   - sugar
+   - cocoa butter
+   - soy lecithin
 
-2. CATEGORIZE as HARMFUL or SAFE:
+2. CATEGORIZE each ingredient as HARMFUL or SAFE based on health and environmental impact.
 
-CRITICAL: Assume ALL ingredients HARMFUL unless explicitly organic or truly raw/unprocessed.
+=== HARMFUL CHEMICALS DATABASE (MUST FLAG) ===
+The following comprehensive database contains chemicals that MUST be flagged as harmful.
+Use your intelligence to match ingredients even if they have different names, spellings, or aliases:
 
-ALWAYS HARMFUL:
+{harmful_chemicals_text}
 
-SWEETENERS (all forms):
-- Sugar, cane sugar, brown sugar (unless "organic cane sugar")
-- Corn syrup, glucose syrup, rice syrup, fructose, dextrose, maltodextrin
-- Artificial sweeteners: sucralose, aspartame, saccharin, acesulfame
-- Molasses, agave, honey (unless raw organic)
+=== CATEGORIZATION RULES ===
 
-SEED OILS (chemically extracted, GMO, hexane-processed):
-- Vegetable oil, canola oil, rapeseed oil
-- Soybean oil, corn oil, cottonseed oil
-- Sunflower oil, safflower oil, grapeseed oil (unless cold-pressed organic)
-- Palm oil (unless certified organic)
-- Hydrogenated/partially hydrogenated oils
+ALWAYS FLAG AS HARMFUL:
+✗ Any ingredient matching the harmful chemicals database above (use semantic matching for aliases)
+✗ Artificial/synthetic dyes and colors (Red 40, Yellow 5, Blue 1, E-numbers, etc.)
+✗ Artificial preservatives (sodium benzoate, potassium sorbate, BHA, BHT, TBHQ, etc.)
+✗ Artificial sweeteners (aspartame, sucralose, saccharin, acesulfame K, etc.)
+✗ Natural Flavor / Natural Flavoring / Flavor / Flavoring (hides synthetic chemicals)
+✗ Fragrance / Parfum (undisclosed chemical cocktails)
+✗ Synthetic chemicals harmful to health (phthalates, parabens, formaldehyde, etc.)
+✗ PFAS compounds (Teflon, Scotchgard, etc.)
+✗ Processed seed oils (canola, soybean, corn oil, cottonseed, etc.)
+✗ High fructose corn syrup, corn syrup, glucose syrup
+✗ Refined/processed sugars (cane sugar, brown sugar, etc.) - FLAG THESE
+✗ Hydrogenated/partially hydrogenated oils
+✗ MSG and hidden MSG (yeast extract, hydrolyzed proteins, etc.)
+✗ Modified starches, maltodextrin
+✗ Heavily processed ingredients (protein isolates, concentrates, etc.)
+✗ Ingredients with known health risks (endocrine disruptors, carcinogens, allergens)
 
-NON-ORGANIC AGRICULTURAL INGREDIENTS (pesticides, GMOs, glyphosate):
-- Cocoa, cocoa butter, cacao (unless organic)
-- Milk, cream, butter, cheese, whey (unless organic - GMO feed, hormones)
-- Eggs (unless organic/pasture-raised - GMO feed)
-- Wheat, flour, oats, corn, soy (unless organic - GMO, glyphosate)
-- Soy lecithin (unless organic - 90% GMO)
-- Rice, grains (unless organic)
-- Chocolate (unless organic)
-- ANY agricultural ingredient NOT labeled "organic"
+MARK AS SAFE:
+✓ Water, sea salt, Himalayan salt
+✓ Whole food ingredients (even if not organic): cocoa, milk, butter, eggs, flour, oats, rice, fruits, vegetables
+✓ Natural oils: olive oil, coconut oil, avocado oil, butter, ghee
+✓ Natural sweeteners: honey, maple syrup, stevia, monk fruit, coconut sugar (even if not organic)
+✓ Basic ingredients: baking soda, baking powder, vanilla extract, cocoa powder, chocolate
+✓ Vitamins and minerals (Vitamin C, Vitamin E, Calcium, Iron, etc.)
+✓ Natural extracts and spices (unless flagged in database)
+✓ Eggs, milk, dairy (even if not organic)
+✓ Grains and legumes (wheat, soy, corn as ingredients - not as oils)
+✓ Natural thickeners: pectin, agar, gelatin
 
-SYNTHETIC ADDITIVES:
-- Modified/hydrolyzed anything
-- Natural flavor, artificial flavor, flavoring, flavouring
-- Colors, E-numbers, dyes (Red 40, Yellow 5, Blue 1, etc.)
-- Preservatives: benzoate, sorbate, nitrite, nitrate, BHT, BHA, TBHQ
-- Emulsifiers: polysorbate, mono/diglycerides, DATEM
-- Thickeners: carrageenan, xanthan gum, guar gum, cellulose gum
-- Sodium compounds (sodium benzoate, disodium EDTA, etc.)
+CRITICAL RULES:
+• Ingredient names may vary: "Red 40" = "Allura Red" = "E129" = "Red dye 40"
+• Use semantic understanding to match database entries
+• "Natural flavor" ALWAYS harmful (hides chemicals)
+• "Fragrance" ALWAYS harmful (undisclosed mix)
+• Sugar IS harmful (flag it)
+• Non-organic ingredients are OK unless they're processed/synthetic
+• When in doubt about matching database: compare category and function
 
-ULTRA-PROCESSED:
-- Maltodextrin, isolated proteins, protein concentrates
-- Enriched, fortified, refined anything
-- Lecithin (unless organic)
-
-PHILOSOPHY:
-- NOT organic → HARMFUL (pesticides, GMOs assumed)
-- Ultra-processed → HARMFUL
-- Synthetic → HARMFUL
-- Refined → HARMFUL
-- Seed oils → HARMFUL
-- When in doubt → HARMFUL
-
-SAFE (VERY STRICT):
-- Water, sea salt, Himalayan salt
-- Explicitly "organic" whole foods only
-- Cold-pressed organic oils (olive, coconut, avocado)
-- Raw unprocessed ingredients
-
-RULES:
-- Extract ALL ingredients (no parentheses in names)
-- Each ingredient in ONE list only
-- NO explanations
-- Output ONLY valid JSON
-
-JSON:
+OUTPUT FORMAT:
+Return ONLY valid JSON with NO explanations:
 {{
-"harmful": ["ingredient1", "ingredient2"],
-"safe": ["ingredient3"]
+    "harmful": ["ingredient1", "ingredient2"],
+    "safe": ["ingredient3", "ingredient4"]
 }}
+
+Each ingredient name should NOT include parentheses or descriptions.
+Every ingredient must appear in exactly ONE list (harmful OR safe, never both).
 """
 
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",  # Faster and cheaper for this task
             messages=[
-                {"role": "system", "content": "You are an expert at parsing ingredient labels and categorizing ingredients based on clean/natural product principles for ALL consumer products (food, beauty, cleaning, personal care). You understand nested ingredients, formatting variations, and can extract all individual ingredients from complex ingredient text."},
+                {"role": "system", "content": "You are an expert at parsing ingredient labels and identifying harmful chemicals. You understand ingredient aliases, chemical names, E-numbers, and can semantically match ingredients to a harmful chemicals database. You always return valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,
+            temperature=0.2,  # Slightly higher for better semantic matching
             max_tokens=1500
         )
         
@@ -1048,6 +1043,7 @@ JSON:
         
     except Exception as e:
         logger.error(f"AI ingredient parsing/separation failed: {e}")
+        return {"harmful": [], "safe": []}
         # Fallback to empty lists
         return {"harmful": [], "safe": []}
 
