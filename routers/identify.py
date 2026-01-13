@@ -230,7 +230,8 @@ async def merge_database_and_vision(
         logger.info(f"Separating {len(ingredients_list)} ingredients with AI intelligent matching")
         
         # Use AI to intelligently separate harmful vs safe (handles name variations automatically)
-        separated = await separate_ingredients_with_ai(ingredients_list, chemical_flags)
+        # Pass the original text, not the list
+        separated = await separate_ingredients_with_ai(ingredients_text, chemical_flags)
         
         harmful_ingredient_names = separated.get("harmful", [])
         safe_ingredient_names = separated.get("safe", [])
@@ -386,7 +387,8 @@ async def ai_only_analysis(image_bytes: bytes, product_info: dict) -> dict:
         logger.info(f"Separating {len(ingredients_list)} ingredients with AI intelligent matching")
         
         # Use AI to intelligently separate harmful vs safe (handles name variations automatically)
-        separated = await separate_ingredients_with_ai(ingredients_list, chemical_flags)
+        # Pass the original text, not the list
+        separated = await separate_ingredients_with_ai(ingredients_text, chemical_flags)
         
         harmful_ingredient_names = separated.get("harmful", [])
         safe_ingredient_names = separated.get("safe", [])

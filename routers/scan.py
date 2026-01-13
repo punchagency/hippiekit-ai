@@ -359,14 +359,19 @@ async def get_product_recommendations_with_image(
             text_parts.append(' '.join(ingredient_list))
         
         text_query = ' '.join([p for p in text_parts if p]).strip()
-        logger.info(f"Rich OCR text query ({len(text_query)} chars): {text_query[:200]}...")
-        logger.info(f"Generating text embedding for: {text_query}")
+        logger.info(f"Rich OCR text query ({len(text_query)} chars): {text_query[:150]}...")
+        
+        logger.info(f"Generating text embedding for: {text_query[:100]}")
         text_embedding = clip_embedder.model.encode(text_query, convert_to_numpy=True)
         
         # Step 2: Generate image embedding if image provided
         if image is not None:
             try:
                 logger.info("Generating image embedding from provided photo")
+                # Ensure image is in RGB mode
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+                
                 image_embedding = clip_embedder.embed_image(image)
                 logger.info("Successfully generated image embedding")
             except Exception as img_error:
@@ -418,7 +423,7 @@ async def get_product_recommendations_with_image(
                 "status": "ai_fallback",
                 "products": [],
                 "ai_alternatives": ai_alternatives,
-                "message": "No similar products found. Showing AI-recommended alternatives.",
+                "message": "No similar products found in Hippiekit database. Showing AI-recommended alternatives.",
                 "embedding_method": embedding_method
             }
         
@@ -451,7 +456,7 @@ async def get_product_recommendations_with_image(
                 "status": "partial",
                 "products": relevant_products,
                 "ai_alternatives": ai_alternatives,
-                "message": f"Found {len(relevant_products)} relevant product. Supplemented with AI alternatives.",
+                "message": f"Found {len(relevant_products)} relevant product. Supplemented with AI-recommended alternatives.",
                 "embedding_method": embedding_method
             }
         else:
@@ -464,25 +469,36 @@ async def get_product_recommendations_with_image(
                 "status": "ai_fallback",
                 "products": [],
                 "ai_alternatives": ai_alternatives,
-                "message": "No relevant matches found. Showing AI-recommended alternatives.",
+                "message": "No relevant products found in Hippiekit database. Showing AI-recommended healthier alternatives.",
                 "embedding_method": embedding_method
             }
             
     except Exception as e:
         logger.error(f"Error in get_product_recommendations_with_image: {e}", exc_info=True)
-        # Return AI fallback on error
-        ai_alternatives = await generate_ai_product_alternatives(
-            product_name=product_name,
-            category=category,
-            count=3
-        )
-        return {
-            "status": "ai_fallback",
-            "products": [],
-            "ai_alternatives": ai_alternatives,
-            "message": f"Error during search: {str(e)}. Showing AI alternatives.",
-            "embedding_method": "error"
-        }
+        
+        # Final fallback: AI alternatives only
+        try:
+            ai_alternatives = await generate_ai_product_alternatives(
+                product_name=product_name,
+                category=category,
+                count=3
+            )
+            
+            return {
+                "status": "ai_fallback",
+                "products": [],
+                "ai_alternatives": ai_alternatives,
+                "message": "Error during search. Showing AI-recommended alternatives.",
+                "embedding_method": "error"
+            }
+        except:
+            return {
+                "status": "error",
+                "products": [],
+                "ai_alternatives": [],
+                "message": "Unable to generate recommendations at this time.",
+                "embedding_method": "error"
+            }
 
 
 async def get_product_recommendations_for_barcode(
