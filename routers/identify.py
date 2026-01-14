@@ -9,7 +9,7 @@ from services.vision_service import get_vision_service
 from services.barcode_service import BarcodeService
 from services.web_search_service import web_search_service
 from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations
-from routers.scan import get_detailed_ingredient_descriptions, analyze_packaging_material, separate_ingredients_with_ai
+from routers.scan import get_detailed_ingredient_descriptions, analyze_packaging_material, separate_ingredients_with_ai, infer_packaging_from_category, infer_ingredients_from_context
 from openai import OpenAI
 import os
 import json
@@ -650,13 +650,30 @@ async def separate_photo_ingredients(
             ingredients_text = web_result['ingredients']
             data_source = web_result['source']
         else:
-            logger.warning(f"No ingredients found for {brand} {product_name}")
-            return {
-                "harmful": [],
-                "safe": [],
-                "data_source": "none",
-                "message": "Could not find ingredient information"
-            }
+            logger.warning(f"No ingredients found via web search for {brand} {product_name}")
+            
+            # FALLBACK: Infer ingredients from context using AI
+            logger.info(f"Attempting to infer ingredients from context")
+            inferred_result = await infer_ingredients_from_context(
+                product_name=product_name,
+                brand=brand,
+                category=category or ''
+            )
+            
+            if inferred_result and inferred_result.get('likely_ingredients'):
+                # Convert list to comma-separated string
+                ingredients_text = ', '.join(inferred_result['likely_ingredients'])
+                data_source = 'ai_inference'
+                logger.info(f"Inferred {len(inferred_result['likely_ingredients'])} ingredients from context")
+            else:
+                # If both web search and inference fail, return empty
+                logger.warning(f"Could not find or infer ingredients for {brand} {product_name}")
+                return {
+                    "harmful": [],
+                    "safe": [],
+                    "data_source": "none",
+                    "message": "Could not find ingredient information"
+                }
         
         # Check for harmful chemicals
         chemical_flags = check_ingredients(ingredients_text)
@@ -744,8 +761,32 @@ async def separate_photo_packaging(
             category=category
         )
         
-        if not web_result or not web_result.get('packaging'):
-            logger.warning(f"No packaging found for {brand} {product_name}")
+        # Check if web search failed OR returned empty materials
+        if not web_result or not web_result.get('packaging') or not web_result.get('materials'):
+            logger.warning(f"No packaging found via web search for {brand} {product_name}")
+            
+            # FALLBACK: Infer packaging from category using AI
+            if category:
+                logger.info(f"Attempting to infer packaging from category: {category}")
+                inferred_materials = await infer_packaging_from_category(
+                    product_name=product_name,
+                    category=category
+                )
+                
+                if inferred_materials:
+                    logger.info(f"Inferred packaging materials: {inferred_materials}")
+                    # Convert inferred materials to lowercase for consistency
+                    materials = [mat.lower() for mat in inferred_materials]
+                    return {
+                        "materials": materials,
+                        "packaging_text": ", ".join(inferred_materials),
+                        "sources": [],
+                        "confidence": "low",
+                        "note": "Packaging inferred from product category"
+                    }
+            
+            # If inference also fails, return empty
+            logger.warning(f"Could not find or infer packaging for {brand} {product_name}")
             return {
                 "materials": [],
                 "packaging_text": "",
