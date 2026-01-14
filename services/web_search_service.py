@@ -321,5 +321,148 @@ Instructions:
         return best_match
 
 
+    async def search_product_packaging(
+        self, 
+        product_name: str, 
+        brand: str,
+        category: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Search for product packaging information using OpenAI's native web search.
+        Uses the Responses API via raw HTTP (Python SDK doesn't support it yet).
+        
+        Args:
+            product_name: Name of the product
+            brand: Brand name
+            category: Optional product category for context
+            
+        Returns:
+            {
+                'packaging': str (packaging materials description),
+                'materials': list of material names,
+                'source': 'openai_web_search',
+                'confidence': 'high' | 'medium' | 'low',
+                'sources': list of source URLs,
+                'note': str
+            }
+        """
+        logger.info(f"[OPENAI WEB SEARCH] Searching for packaging: {brand} {product_name}")
+        
+        # Build search query for packaging
+        query = f"""Find the packaging materials for the product below.
+
+Brand: {brand}
+Product: {product_name}
+{f"Category: {category}" if category else ""}
+
+Instructions:
+- Search the manufacturer website or trusted retailers
+- Find specific packaging materials (plastic pouch, cardboard box, glass jar, etc.)
+- Include plastic types (PET, HDPE, PP, etc.) if available
+- Include recyclability claims and environmental features
+- Respond with a comma-separated list of materials ONLY
+- If no information found, respond with "Not found"
+
+Example: "Plastic pouch (PP), Cardboard sleeve (recycled)"
+"""
+        
+        logger.info(f"[OPENAI WEB SEARCH] Query: {query}")
+        
+        try:
+            # Use shared client for connection pooling
+            client = self._get_client()
+            
+            response = await client.post(
+                "https://api.openai.com/v1/responses",
+                headers={
+                    "Authorization": f"Bearer {self.openai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4.1-mini",
+                    "input": query,
+                    "tools": [{"type": "web_search"}],
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract output text from nested structure
+            output_text = None
+            sources = []
+            
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for content in item.get("content", []):
+                        if content.get("type") == "output_text":
+                            output_text = content.get("text")
+                            
+                            # Extract sources from annotations
+                            for annotation in content.get("annotations", []):
+                                if annotation.get("type") == "url_citation":
+                                    url = annotation.get("url")
+                                    if url:
+                                        sources.append(url)
+            
+            # Deduplicate sources
+            sources = list(dict.fromkeys(sources))
+            
+            if not output_text or len(output_text.strip()) < 5:
+                logger.warning(f"[OPENAI WEB SEARCH] No packaging found for {brand} {product_name}")
+                return None
+            
+            # Filter out non-results
+            if output_text.lower() in ['not found', 'unknown', 'none', 'n/a', 'no information']:
+                logger.warning(f"[OPENAI WEB SEARCH] No packaging information available")
+                return None
+            
+            # Extract material names using common materials list
+            materials = []
+            common_materials = [
+                'plastic', 'glass', 'metal', 'aluminum', 'paper', 'cardboard',
+                'pet', 'hdpe', 'pvc', 'ldpe', 'pp', 'ps', 'steel', 'tin'
+            ]
+            
+            text_lower = output_text.lower()
+            for material in common_materials:
+                if material in text_lower:
+                    materials.append(material)
+            
+            # Remove duplicates
+            materials = list(set(materials))
+            
+            # Determine confidence based on sources
+            confidence = (
+                "high" if len(sources) >= 2 else
+                "medium" if len(sources) == 1 else
+                "low"
+            )
+            
+            logger.info(f"[OPENAI WEB SEARCH] Successfully found packaging: {materials}")
+            logger.info(f"[OPENAI WEB SEARCH] Sources: {len(sources)}")
+            
+            return {
+                "packaging": output_text,
+                "materials": materials,
+                "source": "openai_web_search",
+                "confidence": confidence,
+                "sources": sources,
+                "note": f"Packaging retrieved via OpenAI web search ({len(sources)} sources). Verify with packaging."
+            }
+            
+        except httpx.ConnectTimeout:
+            logger.error(f"[OPENAI WEB SEARCH] Connection timeout - network issue or API unreachable")
+            return None
+        except httpx.ReadTimeout:
+            logger.error(f"[OPENAI WEB SEARCH] Read timeout - web search took too long")
+            return None
+        except httpx.HTTPStatusError as e:
+            logger.error(f"[OPENAI WEB SEARCH] HTTP error {e.response.status_code}: {e.response.text}")
+            return None
+        except Exception as e:
+            logger.exception(f"[OPENAI WEB SEARCH] Packaging search failed: {e}")
+            return None
+
+
 # Global instance
 web_search_service = WebSearchService()

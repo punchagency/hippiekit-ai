@@ -9,7 +9,7 @@ from services.vision_service import get_vision_service
 from services.barcode_service import BarcodeService
 from services.web_search_service import web_search_service
 from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations
-from routers.scan import get_detailed_ingredient_descriptions, analyze_packaging_material, separate_ingredients_with_ai, search_packaging_info
+from routers.scan import get_detailed_ingredient_descriptions, analyze_packaging_material, separate_ingredients_with_ai
 from openai import OpenAI
 import os
 import json
@@ -575,3 +575,241 @@ async def get_product_recommendations(
             status_code=500,
             detail=f"Error getting recommendations: {str(e)}"
         )
+
+
+# ===== MODULAR ENDPOINTS FOR PROGRESSIVE LOADING =====
+
+@router.post("/product/basic")
+async def identify_product_basic(image: UploadFile = File(...)):
+    """
+    Step 1: Get basic product info from image (FAST - 1-2s)
+    Returns only product name, brand, category, type, and marketing claims
+    
+    This is the first call in progressive loading - provides instant feedback
+    """
+    try:
+        logger.info(f"Basic product identification request: {image.filename}")
+        
+        # Read image
+        image_bytes = await image.read()
+        
+        # Use Vision API to identify product
+        vision_service = get_vision_service()
+        product_info = await vision_service.identify_product_from_photo(image_bytes)
+        
+        if not product_info:
+            raise HTTPException(status_code=400, detail="Could not identify product from image")
+        
+        logger.info(f"Product identified: {product_info.get('brand')} {product_info.get('product_name')}")
+        
+        # Return basic info only
+        return {
+            "product_name": product_info['product_name'],
+            "brand": product_info['brand'],
+            "category": product_info.get('category', ''),
+            "product_type": product_info.get('product_type', ''),
+            "marketing_claims": product_info.get('marketing_claims', []),
+            "certifications_visible": product_info.get('certifications_visible', []),
+            "container_info": product_info.get('container_info', {}),
+            "confidence": product_info.get('confidence', 'medium')
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Basic product identification failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/ingredients/separate")
+async def separate_photo_ingredients(
+    product_name: str = Form(...),
+    brand: str = Form(...),
+    category: str = Form(None)
+):
+    """
+    Step 2: Separate ingredients into harmful/safe (FAST - 2-3s)
+    Uses web search to find ingredients, then AI to separate them
+    
+    Returns just the ingredient names, descriptions come later
+    """
+    try:
+        logger.info(f"Separating ingredients for: {brand} {product_name}")
+        
+        # Search web for ingredients
+        web_result = await web_search_service.search_product_ingredients(
+            product_name=product_name,
+            brand=brand,
+            category=category
+        )
+        
+        ingredients_text = ""
+        data_source = "web_search"
+        
+        if web_result and web_result.get('ingredients'):
+            ingredients_text = web_result['ingredients']
+            data_source = web_result['source']
+        else:
+            logger.warning(f"No ingredients found for {brand} {product_name}")
+            return {
+                "harmful": [],
+                "safe": [],
+                "data_source": "none",
+                "message": "Could not find ingredient information"
+            }
+        
+        # Check for harmful chemicals
+        chemical_flags = check_ingredients(ingredients_text)
+        
+        # Use AI to separate ingredients (handles name variations)
+        separated = await separate_ingredients_with_ai(ingredients_text, chemical_flags)
+        
+        logger.info(f"Separated: {len(separated.get('harmful', []))} harmful, {len(separated.get('safe', []))} safe")
+        
+        return {
+            "harmful": separated.get("harmful", []),
+            "safe": separated.get("safe", []),
+            "data_source": data_source,
+            "ingredients_text": ingredients_text  # Return for future calls
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to separate ingredients: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/ingredients/describe")
+async def describe_photo_ingredients(
+    harmful_ingredients: str = Form(""),  # Comma-separated list (optional)
+    safe_ingredients: str = Form("")  # Comma-separated list (optional)
+):
+    """
+    Step 3: Get AI descriptions for ingredients (SLOWER - 3-5s)
+    
+    This is called after ingredients are separated and displayed
+    Progressively enhances the UI with detailed descriptions
+    """
+    try:
+        # Parse comma-separated lists
+        harmful_list = [ing.strip() for ing in harmful_ingredients.split(',') if ing.strip()]
+        safe_list = [ing.strip() for ing in safe_ingredients.split(',') if ing.strip()]
+        
+        # If no ingredients provided, return empty descriptions
+        if not harmful_list and not safe_list:
+            logger.warning("No ingredients provided for description")
+            return {
+                "descriptions": {
+                    "harmful": {},
+                    "safe": {}
+                }
+            }
+        
+        logger.info(f"Generating descriptions for {len(harmful_list)} harmful + {len(safe_list)} safe ingredients")
+        
+        # Generate descriptions
+        descriptions = get_detailed_ingredient_descriptions(
+            safe_ingredients=safe_list,
+            harmful_ingredients=harmful_list,
+            harmful_chemicals_db=[]  # Descriptions don't need chemical flags
+        )
+        
+        return {
+            "descriptions": descriptions
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to describe ingredients: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/packaging/separate")
+async def separate_photo_packaging(
+    product_name: str = Form(...),
+    brand: str = Form(...),
+    category: str = Form(None)
+):
+    """
+    Step 4: Get packaging material names (FAST - 1-2s)
+    Uses web search to find packaging info
+    
+    Returns just the material names, descriptions come later
+    """
+    try:
+        logger.info(f"Finding packaging for: {brand} {product_name}")
+        
+        # Use web_search_service instead of broken search_packaging_info
+        web_result = await web_search_service.search_product_packaging(
+            product_name=product_name,
+            brand=brand,
+            category=category
+        )
+        
+        if not web_result or not web_result.get('packaging'):
+            logger.warning(f"No packaging found for {brand} {product_name}")
+            return {
+                "materials": [],
+                "packaging_text": "",
+                "message": "No packaging information found"
+            }
+        
+        # Extract data from web_search_service result
+        packaging_text = web_result.get('packaging', '')
+        materials = web_result.get('materials', [])
+        
+        logger.info(f"Found packaging materials: {materials}")
+        logger.info(f"Sources: {len(web_result.get('sources', []))}")
+        
+        return {
+            "materials": materials,
+            "packaging_text": packaging_text,
+            "sources": web_result.get('sources', []),
+            "confidence": web_result.get('confidence', 'medium')
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to find packaging: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/packaging/describe")
+async def describe_photo_packaging(
+    packaging_text: str = Form(...),
+    materials: str = Form(...),  # Comma-separated list
+    brand_name: str = Form(None),
+    product_name: str = Form(None),
+    category: str = Form(None)
+):
+    """
+    Step 5: Get detailed packaging analysis (SLOWER - 2-4s)
+    
+    This is called after material names are displayed
+    Progressively enhances the UI with safety analysis
+    
+    Args:
+        packaging_text: Raw packaging description from web search
+        materials: Comma-separated list of material names
+        brand_name: Product brand (optional, improves analysis)
+        product_name: Product name (optional, improves analysis)
+        category: Product category (optional, improves analysis)
+    """
+    try:
+        # Parse materials list
+        materials_list = [mat.strip() for mat in materials.split(',') if mat.strip()]
+        
+        logger.info(f"Analyzing packaging for {brand_name} {product_name}: {materials_list}")
+        
+        # Analyze packaging with AI - pass product context for better descriptions
+        packaging_analysis = analyze_packaging_material(
+            packaging_text=packaging_text,
+            packaging_tags=materials_list,
+            normalized_materials=materials_list,
+            brand_name=brand_name,
+            product_name=product_name,
+            categories=category
+        )
+        
+        return packaging_analysis
+        
+    except Exception as e:
+        logger.error(f"Failed to analyze packaging: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
