@@ -779,72 +779,122 @@ async def describe_photo_ingredients(
 async def separate_photo_packaging(
     product_name: str = Form(...),
     brand: str = Form(""),
-    category: str = Form("")
+    category: str = Form(""),
+    container_material: str = Form(""),
+    container_type: str = Form("")
 ):
     """
-    Step 4: Get packaging material names (FAST - 1-2s)
-    Uses web search to find packaging info
+    Step 4: Get packaging material names (FAST - <1s)
+    PRIMARY: Uses container info from vision service
+    FALLBACK 1: AI inference from category
+    FALLBACK 2: Web search
     
     Returns just the material names, descriptions come later
     """
     start_time = time.time()
     try:
         logger.info(f"Finding packaging for: {brand} {product_name}")
+        logger.info(f"Vision data - Material: '{container_material}', Type: '{container_type}'")
         
-        # Use web_search_service instead of broken search_packaging_info
+        materials = []
+        packaging_text = ""
+        data_source = "none"
+        confidence = "low"
+        
+        # PRIMARY: Use vision service data if available (FASTEST - already extracted)
+        if container_material or container_type:
+            # Build materials list from vision data
+            if container_material and container_material.lower() not in ['not visible', 'not visible in image', '']:
+                materials.append(container_material)
+                packaging_text = container_material
+                data_source = "vision"
+                confidence = "high"
+                
+            if container_type and container_type.lower() not in ['not visible', 'not visible in image', '']:
+                if container_type not in materials:  # Avoid duplicates
+                    materials.append(container_type)
+                packaging_text = f"{container_material}, {container_type}" if container_material else container_type
+                data_source = "vision"
+                confidence = "high"
+            
+            if materials:
+                logger.info(f"Using vision data: {materials}")
+                elapsed_time = time.time() - start_time
+                logger.info(f"⏱️ /packaging/separate completed in {elapsed_time:.2f}s (vision data)")
+                
+                return {
+                    "materials": materials,
+                    "packaging_text": packaging_text,
+                    "data_source": data_source,
+                    "confidence": confidence,
+                    "_elapsed_time": round(elapsed_time, 2)
+                }
+        
+        # FALLBACK 1: Infer packaging from category using AI (FAST - 1-2s)
+        if category:
+            logger.info(f"Vision data insufficient, inferring from category: {category}")
+            inferred_materials = await infer_packaging_from_category(
+                product_name=product_name,
+                category=category
+            )
+            
+            if inferred_materials:
+                logger.info(f"Inferred packaging materials: {inferred_materials}")
+                materials = [mat.lower() for mat in inferred_materials]
+                packaging_text = ", ".join(inferred_materials)
+                data_source = "ai_inference"
+                confidence = "medium"
+                
+                elapsed_time = time.time() - start_time
+                logger.info(f"⏱️ /packaging/separate completed in {elapsed_time:.2f}s (AI inference)")
+                
+                return {
+                    "materials": materials,
+                    "packaging_text": packaging_text,
+                    "data_source": data_source,
+                    "confidence": confidence,
+                    "_elapsed_time": round(elapsed_time, 2)
+                }
+        
+        # FALLBACK 2: Web search (SLOWER - 2-3s)
+        logger.warning(f"AI inference failed, trying web search for {brand} {product_name}")
         web_result = await web_search_service.search_product_packaging(
             product_name=product_name,
             brand=brand,
             category=category
         )
         
-        # Check if web search failed OR returned empty materials
-        if not web_result or not web_result.get('packaging') or not web_result.get('materials'):
-            logger.warning(f"No packaging found via web search for {brand} {product_name}")
+        # Check if web search succeeded
+        if web_result and web_result.get('packaging') and web_result.get('materials'):
+            packaging_text = web_result.get('packaging', '')
+            materials = web_result.get('materials', [])
+            data_source = "web_search"
+            confidence = web_result.get('confidence', 'medium')
             
-            # FALLBACK: Infer packaging from category using AI
-            if category:
-                logger.info(f"Attempting to infer packaging from category: {category}")
-                inferred_materials = await infer_packaging_from_category(
-                    product_name=product_name,
-                    category=category
-                )
-                
-                if inferred_materials:
-                    logger.info(f"Inferred packaging materials: {inferred_materials}")
-                    # Convert inferred materials to lowercase for consistency
-                    materials = [mat.lower() for mat in inferred_materials]
-                    return {
-                        "materials": materials,
-                        "packaging_text": ", ".join(inferred_materials),
-                        "sources": [],
-                        "confidence": "low",
-                        "note": "Packaging inferred from product category"
-                    }
+            logger.info(f"Found packaging via web search: {materials}")
             
-            # If inference also fails, return empty
-            logger.warning(f"Could not find or infer packaging for {brand} {product_name}")
+            elapsed_time = time.time() - start_time
+            logger.info(f"⏱️ /packaging/separate completed in {elapsed_time:.2f}s (web search)")
+            
             return {
-                "materials": [],
-                "packaging_text": "",
-                "message": "No packaging information found"
+                "materials": materials,
+                "packaging_text": packaging_text,
+                "sources": web_result.get('sources', []),
+                "data_source": data_source,
+                "confidence": confidence,
+                "_elapsed_time": round(elapsed_time, 2)
             }
         
-        # Extract data from web_search_service result
-        packaging_text = web_result.get('packaging', '')
-        materials = web_result.get('materials', [])
-        
-        logger.info(f"Found packaging materials: {materials}")
-        logger.info(f"Sources: {len(web_result.get('sources', []))}")
-        
+        # If all methods fail, return empty
+        logger.warning(f"Could not find packaging info for {brand} {product_name}")
         elapsed_time = time.time() - start_time
-        logger.info(f"⏱️ /packaging/separate completed in {elapsed_time:.2f}s")
         
         return {
-            "materials": materials,
-            "packaging_text": packaging_text,
-            "sources": web_result.get('sources', []),
-            "confidence": web_result.get('confidence', 'medium'),
+            "materials": [],
+            "packaging_text": "",
+            "data_source": "none",
+            "confidence": "none",
+            "message": "No packaging information found",
             "_elapsed_time": round(elapsed_time, 2)
         }
         
