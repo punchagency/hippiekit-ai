@@ -9,11 +9,12 @@ from services.vision_service import get_vision_service
 from services.barcode_service import BarcodeService
 from services.web_search_service import web_search_service
 from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations
-from routers.scan import get_detailed_ingredient_descriptions, analyze_packaging_material, separate_ingredients_with_ai, infer_packaging_from_category, infer_ingredients_from_context
+from routers.scan import get_detailed_ingredient_descriptions, analyze_packaging_material, separate_ingredients_with_ai, infer_packaging_from_category, search_ingredients_from_context, infer_ingredients_from_category
 from openai import OpenAI
 import os
 import json
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -528,6 +529,7 @@ async def get_product_recommendations(
             }
         }
     """
+    start_time = time.time()
     try:
         from routers.scan import get_product_recommendations_with_image
         from PIL import Image
@@ -563,14 +565,19 @@ async def get_product_recommendations(
             min_score=0.4
         )
         
+        elapsed_time = time.time() - start_time
+        logger.info(f"⏱️ /product/recommendations completed in {elapsed_time:.2f}s")
+        
         return {
             'success': True,
             'recommendations': recommendations,
-            'message': 'Recommendations generated successfully'
+            'message': 'Recommendations generated successfully',
+            '_elapsed_time': round(elapsed_time, 2)
         }
         
     except Exception as e:
-        logger.error(f"Error getting product recommendations: {e}", exc_info=True)
+        elapsed_time = time.time() - start_time
+        logger.error(f"Error getting product recommendations after {elapsed_time:.2f}s: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Error getting recommendations: {str(e)}"
@@ -587,6 +594,7 @@ async def identify_product_basic(image: UploadFile = File(...)):
     
     This is the first call in progressive loading - provides instant feedback
     """
+    start_time = time.time()
     try:
         logger.info(f"Basic product identification request: {image.filename}")
         
@@ -602,6 +610,9 @@ async def identify_product_basic(image: UploadFile = File(...)):
         
         logger.info(f"Product identified: {product_info.get('brand')} {product_info.get('product_name')}")
         
+        elapsed_time = time.time() - start_time
+        logger.info(f"⏱️ /product/basic completed in {elapsed_time:.2f}s")
+        
         # Return basic info only
         return {
             "product_name": product_info['product_name'],
@@ -611,21 +622,23 @@ async def identify_product_basic(image: UploadFile = File(...)):
             "marketing_claims": product_info.get('marketing_claims', []),
             "certifications_visible": product_info.get('certifications_visible', []),
             "container_info": product_info.get('container_info', {}),
-            "confidence": product_info.get('confidence', 'medium')
+            "confidence": product_info.get('confidence', 'medium'),
+            "_elapsed_time": round(elapsed_time, 2)
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Basic product identification failed: {e}")
+        elapsed_time = time.time() - start_time
+        logger.error(f"Basic product identification failed after {elapsed_time:.2f}s: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/ingredients/separate")
 async def separate_photo_ingredients(
     product_name: str = Form(...),
-    brand: str = Form(...),
-    category: str = Form(None)
+    brand: str = Form(""),
+    category: str = Form("")
 ):
     """
     Step 2: Separate ingredients into harmful/safe (FAST - 2-3s)
@@ -633,47 +646,60 @@ async def separate_photo_ingredients(
     
     Returns just the ingredient names, descriptions come later
     """
+    start_time = time.time()
     try:
         logger.info(f"Separating ingredients for: {brand} {product_name}")
         
-        # Search web for ingredients
-        web_result = await web_search_service.search_product_ingredients(
+        # PRIMARY: AI inference without web search (FASTEST - 1-2s)
+        logger.info(f"Inferring ingredients from category")
+        inferred_result = await infer_ingredients_from_category(
             product_name=product_name,
             brand=brand,
-            category=category
+            category=category or ''
         )
         
         ingredients_text = ""
-        data_source = "web_search"
+        data_source = "ai_inference"
         
-        if web_result and web_result.get('ingredients'):
-            ingredients_text = web_result['ingredients']
-            data_source = web_result['source']
+        if inferred_result and inferred_result.get('likely_ingredients'):
+            ingredients_text = ', '.join(inferred_result['likely_ingredients'])
+            data_source = 'ai_inference'
+            logger.info(f"Inferred {len(inferred_result['likely_ingredients'])} ingredients from category")
         else:
-            logger.warning(f"No ingredients found via web search for {brand} {product_name}")
-            
-            # FALLBACK: Infer ingredients from context using AI
-            logger.info(f"Attempting to infer ingredients from context")
-            inferred_result = await infer_ingredients_from_context(
+            # FALLBACK 1: Search web for ingredients (SLOWER - 2-3s)
+            logger.warning(f"AI inference failed, searching web for ingredients")
+            web_result = await web_search_service.search_product_ingredients(
                 product_name=product_name,
                 brand=brand,
-                category=category or ''
+                category=category
             )
             
-            if inferred_result and inferred_result.get('likely_ingredients'):
-                # Convert list to comma-separated string
-                ingredients_text = ', '.join(inferred_result['likely_ingredients'])
-                data_source = 'ai_inference'
-                logger.info(f"Inferred {len(inferred_result['likely_ingredients'])} ingredients from context")
+            if web_result and web_result.get('ingredients'):
+                ingredients_text = web_result['ingredients']
+                data_source = web_result['source']
+                logger.info(f"Found ingredients via web search")
             else:
-                # If both web search and inference fail, return empty
-                logger.warning(f"Could not find or infer ingredients for {brand} {product_name}")
-                return {
-                    "harmful": [],
-                    "safe": [],
-                    "data_source": "none",
-                    "message": "Could not find ingredient information"
-                }
+                # FALLBACK 2: Alternative web search with context
+                logger.warning(f"Primary web search failed, trying context search")
+                search_result = await search_ingredients_from_context(
+                    product_name=product_name,
+                    brand=brand,
+                    category=category or ''
+                )
+                
+                if search_result and search_result.get('likely_ingredients'):
+                    ingredients_text = ', '.join(search_result['likely_ingredients'])
+                    data_source = 'web_search_context'
+                    logger.info(f"Found {len(search_result['likely_ingredients'])} ingredients via context search")
+                else:
+                    # If all methods fail, return empty
+                    logger.warning(f"Could not find or infer ingredients for {brand} {product_name}")
+                    return {
+                        "harmful": [],
+                        "safe": [],
+                        "data_source": "none",
+                        "message": "Could not find ingredient information"
+                    }
         
         # Check for harmful chemicals
         chemical_flags = check_ingredients(ingredients_text)
@@ -681,17 +707,21 @@ async def separate_photo_ingredients(
         # Use AI to separate ingredients (handles name variations)
         separated = await separate_ingredients_with_ai(ingredients_text, chemical_flags)
         
+        elapsed_time = time.time() - start_time
         logger.info(f"Separated: {len(separated.get('harmful', []))} harmful, {len(separated.get('safe', []))} safe")
+        logger.info(f"⏱️ /ingredients/separate completed in {elapsed_time:.2f}s")
         
         return {
             "harmful": separated.get("harmful", []),
             "safe": separated.get("safe", []),
             "data_source": data_source,
-            "ingredients_text": ingredients_text  # Return for future calls
+            "ingredients_text": ingredients_text,  # Return for future calls
+            "_elapsed_time": round(elapsed_time, 2)
         }
         
     except Exception as e:
-        logger.error(f"Failed to separate ingredients: {e}")
+        elapsed_time = time.time() - start_time
+        logger.error(f"Failed to separate ingredients after {elapsed_time:.2f}s: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -706,6 +736,7 @@ async def describe_photo_ingredients(
     This is called after ingredients are separated and displayed
     Progressively enhances the UI with detailed descriptions
     """
+    start_time = time.time()
     try:
         # Parse comma-separated lists
         harmful_list = [ing.strip() for ing in harmful_ingredients.split(',') if ing.strip()]
@@ -730,20 +761,25 @@ async def describe_photo_ingredients(
             harmful_chemicals_db=[]  # Descriptions don't need chemical flags
         )
         
+        elapsed_time = time.time() - start_time
+        logger.info(f"⏱️ /ingredients/describe completed in {elapsed_time:.2f}s")
+        
         return {
-            "descriptions": descriptions
+            "descriptions": descriptions,
+            "_elapsed_time": round(elapsed_time, 2)
         }
         
     except Exception as e:
-        logger.error(f"Failed to describe ingredients: {e}")
+        elapsed_time = time.time() - start_time
+        logger.error(f"Failed to describe ingredients after {elapsed_time:.2f}s: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/packaging/separate")
 async def separate_photo_packaging(
     product_name: str = Form(...),
-    brand: str = Form(...),
-    category: str = Form(None)
+    brand: str = Form(""),
+    category: str = Form("")
 ):
     """
     Step 4: Get packaging material names (FAST - 1-2s)
@@ -751,6 +787,7 @@ async def separate_photo_packaging(
     
     Returns just the material names, descriptions come later
     """
+    start_time = time.time()
     try:
         logger.info(f"Finding packaging for: {brand} {product_name}")
         
@@ -800,15 +837,20 @@ async def separate_photo_packaging(
         logger.info(f"Found packaging materials: {materials}")
         logger.info(f"Sources: {len(web_result.get('sources', []))}")
         
+        elapsed_time = time.time() - start_time
+        logger.info(f"⏱️ /packaging/separate completed in {elapsed_time:.2f}s")
+        
         return {
             "materials": materials,
             "packaging_text": packaging_text,
             "sources": web_result.get('sources', []),
-            "confidence": web_result.get('confidence', 'medium')
+            "confidence": web_result.get('confidence', 'medium'),
+            "_elapsed_time": round(elapsed_time, 2)
         }
         
     except Exception as e:
-        logger.error(f"Failed to find packaging: {e}")
+        elapsed_time = time.time() - start_time
+        logger.error(f"Failed to find packaging after {elapsed_time:.2f}s: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -833,6 +875,7 @@ async def describe_photo_packaging(
         product_name: Product name (optional, improves analysis)
         category: Product category (optional, improves analysis)
     """
+    start_time = time.time()
     try:
         # Parse materials list
         materials_list = [mat.strip() for mat in materials.split(',') if mat.strip()]
@@ -849,8 +892,15 @@ async def describe_photo_packaging(
             categories=category
         )
         
+        elapsed_time = time.time() - start_time
+        logger.info(f"⏱️ /packaging/describe completed in {elapsed_time:.2f}s")
+        
+        # Add timing to response
+        packaging_analysis['_elapsed_time'] = round(elapsed_time, 2)
+        
         return packaging_analysis
         
     except Exception as e:
-        logger.error(f"Failed to analyze packaging: {e}")
+        elapsed_time = time.time() - start_time
+        logger.error(f"Failed to analyze packaging after {elapsed_time:.2f}s: {e}")
         raise HTTPException(status_code=500, detail=str(e))

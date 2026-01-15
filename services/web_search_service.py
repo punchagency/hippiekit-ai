@@ -125,6 +125,19 @@ Instructions:
                 logger.debug(f"[OPENAI WEB SEARCH] Raw response: {data}")
                 return None
             
+            # Check if the response is actually saying "couldn't find" instead of providing ingredients
+            negative_indicators = [
+                "couldn't locate", "couldn't find", "could not find", "not available",
+                "unable to locate", "unable to find", "no ingredient list", 
+                "doesn't provide", "does not provide", "not listed", "not provided",
+                "I don't have", "I cannot find", "not accessible"
+            ]
+            
+            output_lower = output_text.lower()
+            if any(indicator in output_lower for indicator in negative_indicators):
+                logger.warning(f"[OPENAI WEB SEARCH] Response indicates no ingredients found: {output_text[:100]}...")
+                return None
+            
             # Determine confidence based on sources
             confidence = (
                 "high" if len(sources) >= 2 else
@@ -411,9 +424,22 @@ Example: "Plastic pouch (PP), Cardboard sleeve (recycled)"
                 logger.warning(f"[OPENAI WEB SEARCH] No packaging found for {brand} {product_name}")
                 return None
             
-            # Filter out non-results
+            # Filter out non-results (exact matches)
             if output_text.lower() in ['not found', 'unknown', 'none', 'n/a', 'no information']:
                 logger.warning(f"[OPENAI WEB SEARCH] No packaging information available")
+                return None
+            
+            # Check if the response is actually saying "couldn't find" instead of providing packaging info
+            negative_indicators = [
+                "couldn't locate", "couldn't find", "could not find", "not available",
+                "unable to locate", "unable to find", "no packaging", 
+                "doesn't provide", "does not provide", "not listed", "not provided",
+                "I don't have", "I cannot find", "not accessible"
+            ]
+            
+            output_lower = output_text.lower()
+            if any(indicator in output_lower for indicator in negative_indicators):
+                logger.warning(f"[OPENAI WEB SEARCH] Response indicates no packaging found: {output_text[:100]}...")
                 return None
             
             # Extract material names using common materials list

@@ -75,14 +75,14 @@ def normalize_ingredient_text(text: str) -> str:
     return text
 
 
-async def infer_ingredients_from_context(
+async def search_ingredients_from_context(
     product_name: str,
     brand: str,
     category: str,
     image_url: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Use web search and AI to find actual product ingredients when OpenFacts data is missing.
+    Use OpenAI web search to find actual product ingredients.
     Works for all consumer products: food, skincare, pet, kitchen, bathroom, etc.
     
     Args:
@@ -92,14 +92,14 @@ async def infer_ingredients_from_context(
         image_url: Optional product image URL
         
     Returns:
-        Dictionary with actual ingredients found via web search (no additives/packaging/metadata)
+        Dictionary with actual ingredients found via web search
         Format: {"likely_ingredients": ["ingredient1", "ingredient2", ...]}
     """
     try:
         # Import web search service
         from services.web_search_service import web_search_service
         
-        logger.info(f"[INGREDIENT INFERENCE] Searching web for: {brand} {product_name}")
+        logger.info(f"[INGREDIENT SEARCH] Searching web for: {brand} {product_name}")
         
         # Use web search to find actual ingredients
         search_result = await web_search_service.search_product_ingredients(
@@ -119,16 +119,101 @@ async def infer_ingredients_from_context(
                 if ing.strip()
             ]
             
-            logger.info(f"[INGREDIENT INFERENCE] Found {len(ingredients_list)} ingredients from {search_result.get('source', 'unknown source')}")
+            logger.info(f"[INGREDIENT SEARCH] Found {len(ingredients_list)} ingredients from {search_result.get('source', 'unknown source')}")
             
             return {
                 "likely_ingredients": ingredients_list
             }
         
-        logger.warning(f"[INGREDIENT INFERENCE] No ingredients found for {brand} {product_name}")
+        logger.warning(f"[INGREDIENT SEARCH] No ingredients found for {brand} {product_name}")
         return {
             "likely_ingredients": []
         }
+        
+    except Exception as e:
+        logger.error(f"[INGREDIENT SEARCH] Failed: {e}")
+        return {
+            "likely_ingredients": []
+        }
+
+
+async def infer_ingredients_from_category(
+    product_name: str,
+    brand: str,
+    category: str
+) -> Dict[str, Any]:
+    """
+    Infer the EXACT ingredients for this specific product using AI knowledge (NO web search).
+    Attempts to recall the actual formulation if the product is known.
+    
+    Args:
+        product_name: Product name
+        brand: Brand name
+        category: Product category
+        
+    Returns:
+        Dictionary with AI-inferred ingredients
+        Format: {"likely_ingredients": ["ingredient1", "ingredient2", ...]}
+    """
+    try:
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
+        prompt = f"""Do you have EXACT knowledge of the ingredient list for this specific product from your training data?
+
+Product: {product_name}
+Brand: {brand}
+Category: {category}
+
+CRITICAL INSTRUCTIONS:
+- ONLY return ingredients if you have definitive knowledge of this EXACT product's formulation
+- If you are uncertain, guessing, or only know typical ingredients for this category: return an empty array
+- Do NOT infer or guess based on similar products or category standards
+- We have other systems that will handle products you don't know
+
+Return format:
+{{"ingredients": ["ingredient1", "ingredient2", ...]}} if you KNOW this exact product
+{{"ingredients": []}} if you are uncertain or don't have exact knowledge
+
+Example of KNOWN product: Dove Original Beauty Bar → {{"ingredients": ["Sodium Lauroyl Isethionate", "Stearic Acid", "Sodium Tallowate", ...]}}
+Example of UNKNOWN product: Generic store brand dish soap → {{"ingredients": []}}"""
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a product database expert. Only return ingredient lists for products you definitively know. If uncertain about ANY product, return an empty array. DO NOT guess or infer. Return only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,
+            max_tokens=300,
+            response_format={"type": "json_object"}
+        )
+        
+        content = response.choices[0].message.content.strip()
+        
+        # Parse JSON response
+        try:
+            result = json.loads(content)
+            # Handle if wrapped in object like {"ingredients": [...]}
+            if isinstance(result, dict):
+                ingredients = result.get("ingredients", list(result.values())[0] if result else [])
+            else:
+                ingredients = result
+                
+            if isinstance(ingredients, list) and ingredients:
+                logger.info(f"[INGREDIENT INFERENCE] Found exact ingredients for {brand} {product_name}: {len(ingredients)} items")
+                return {
+                    "likely_ingredients": ingredients
+                }
+            else:
+                logger.info(f"[INGREDIENT INFERENCE] No exact knowledge of {brand} {product_name} - returning empty for fallback")
+                return {
+                    "likely_ingredients": []
+                }
+        except json.JSONDecodeError as e:
+            logger.error(f"[INGREDIENT INFERENCE] Failed to parse JSON: {e}")
+            return {
+                "likely_ingredients": []
+            }
         
     except Exception as e:
         logger.error(f"[INGREDIENT INFERENCE] Failed: {e}")
@@ -1965,11 +2050,11 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
         # AI INFERENCE if ingredients missing or minimal
         if not ingredients_text or len(ingredients_text.strip()) < 20:
             logger.info(f"[INGREDIENTS-SEPARATE] Minimal data - attempting AI inference")
-            inference_data = await infer_ingredients_from_context(
+            inference_data = await infer_ingredients_from_category(
                 product_name=product_data.get("name", "Unknown"),
                 brand=product_data.get("brands", ""),
                 category=product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General",
-                image_url=product_data.get("image_url")
+                # image_url=product_data.get("image_url")
             )
             
             if inference_data and inference_data.get("likely_ingredients"):
@@ -1977,6 +2062,21 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
                 ingredients_text = ingredients_text + ", " + inferred_ingredients if ingredients_text else inferred_ingredients
                 
                 logger.info(f"[INGREDIENTS-SEPARATE] AI inference added {len(inference_data['likely_ingredients'])} ingredients")
+            
+            # WEB SEARCH FALLBACK if AI inference failed or returned minimal data
+            if not ingredients_text or len(ingredients_text.strip()) < 20:
+                logger.info(f"[INGREDIENTS-SEPARATE] AI inference insufficient - attempting web search")
+                web_search_data = await search_ingredients_from_context(
+                    product_name=product_data.get("name", "Unknown"),
+                    brand=product_data.get("brands", ""),
+                    category=product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General"
+                )
+                
+                if web_search_data and web_search_data.get("ingredients_text"):
+                    web_search_ingredients = web_search_data["ingredients_text"]
+                    ingredients_text = ingredients_text + ", " + web_search_ingredients if ingredients_text else web_search_ingredients
+                    
+                    logger.info(f"[INGREDIENTS-SEPARATE] Web search added ingredients: {web_search_ingredients[:100]}...")
         
         if not ingredients_text or not ingredients_text.strip():
             return {
