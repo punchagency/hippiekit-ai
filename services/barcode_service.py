@@ -7,11 +7,13 @@ Includes web search fallback for products with empty ingredient data
 import requests
 import asyncio
 import aiohttp
+import time
 from typing import Optional, Dict, Any, List
 import logging
 from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations
 from services.web_search_service import web_search_service
 from services.cache_service import cache_service
+from services.timing_logger import async_time_operation, log_timing_summary
 
 logger = logging.getLogger(__name__)
 
@@ -42,18 +44,35 @@ class BarcodeService:
         Returns:
             Normalized product data or None if not found
         """
+        total_start = time.time()
+        timings = {}
+        
         # Check cache first
+        cache_start = time.time()
         cached_result = await self.cache.get_barcode(barcode)
+        timings["cache_check"] = (time.time() - cache_start) * 1000
+        
         if cached_result:
+            print(f"   ⚡ [CACHE HIT] Barcode {barcode} found in cache")
             logger.info(f"Returning cached result for barcode: {barcode}")
             return cached_result
         
+        print(f"   📭 [CACHE MISS] Barcode {barcode} not in cache, querying databases...")
+        
         # Cache miss - query databases
+        db_start = time.time()
         result = await self._fetch_from_databases(barcode)
+        timings["database_queries"] = (time.time() - db_start) * 1000
         
         # Cache the result if found
         if result:
+            cache_set_start = time.time()
             await self.cache.set_barcode(barcode, result)
+            timings["cache_set"] = (time.time() - cache_set_start) * 1000
+        
+        # Log timing summary
+        total_ms = (time.time() - total_start) * 1000
+        log_timing_summary(timings, total_ms, f"lookup_barcode({barcode})")
         
         return result
     
