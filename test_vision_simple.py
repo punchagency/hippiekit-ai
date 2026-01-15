@@ -27,7 +27,7 @@ start = time.time()
 
 try:
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4o-mini",  # Optimized: 4x faster than gpt-4o
         messages=[
             {
                 "role": "user",

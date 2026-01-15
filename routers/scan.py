@@ -1266,6 +1266,246 @@ Example: {"Sugar": "Refined white sugar is an ultra-processed sweetener that spi
         return {"safe": {}, "harmful": {}}
 
 
+# === ASYNC PARALLEL VERSIONS FOR OPTIMIZED PERFORMANCE ===
+
+async def _generate_harmful_descriptions_async(harmful_ingredients: list, harmful_chemicals_db: list) -> dict:
+    """
+    Async version of harmful ingredient description generation.
+    Runs in thread pool to avoid blocking.
+    """
+    if not harmful_ingredients:
+        return {}
+    
+    def _sync_generate():
+        try:
+            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+            
+            harmful_items = []
+            for ing_name in harmful_ingredients[:15]:
+                db_info = None
+                for chem in harmful_chemicals_db:
+                    if chem.get('name', '').lower() == ing_name.lower():
+                        db_info = chem
+                        break
+                
+                if db_info:
+                    harmful_items.append(f"{ing_name} (Category: {db_info.get('category', 'unknown')})")
+                else:
+                    harmful_items.append(f"{ing_name} (AI flagged as harmful)")
+            
+            harmful_str = ", ".join(harmful_items)
+            
+            harmful_prompt = f"""Analyze these harmful chemicals/ingredients found in a consumer product.
+
+FLAGGED CHEMICALS (authoritative — do not dispute or soften):
+{harmful_str}
+
+For each chemical, provide a description that:
+1. States what the chemical is and its industrial/synthetic use in consumer products
+2. Explains why it's harmful to human health and/or the environment
+3. Calls out specific health risks, toxicity concerns, or environmental damage
+4. Uses clear, direct language - no corporate apologetics
+
+CRITICAL RULES:
+• These ingredients are FLAGGED for a reason - do not defend them
+• If it's synthetic, lab-derived, or industrially processed, emphasize that
+• E-numbers should be called out as synthetic petroleum-based additives
+• Never say "safe in small amounts" or cite regulatory approval as reassurance
+
+Format as JSON: {{"Chemical Name Exactly As Listed": "critical description"}}
+
+Harmful chemicals: {harmful_str}"""
+            
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": "You are a strict ingredient auditor. Output valid JSON only with ingredient names as keys."
+                    },
+                    {"role": "user", "content": harmful_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=1200,
+                response_format={"type": "json_object"}
+            )
+            
+            content = response.choices[0].message.content.strip()
+            return json.loads(content)
+            
+        except Exception as e:
+            logger.error(f"Async harmful descriptions failed: {e}")
+            return {ing: "Flagged as potentially harmful ingredient." for ing in harmful_ingredients}
+    
+    return await asyncio.get_event_loop().run_in_executor(None, _sync_generate)
+
+
+async def _generate_safe_descriptions_async(safe_ingredients: list) -> dict:
+    """
+    Async version of safe ingredient description generation.
+    Runs in thread pool to avoid blocking.
+    """
+    if not safe_ingredients:
+        return {}
+    
+    def _sync_generate():
+        try:
+            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+            
+            ingredients_str = ", ".join(safe_ingredients)
+            
+            safe_prompt = f"""Analyze these safe/common ingredients from a clean product perspective.
+
+INGREDIENTS: {ingredients_str}
+
+For each, provide a brief 1-2 sentence description:
+1. What it is (natural vs processed)
+2. Its purpose in products
+3. Any processing concerns
+
+Return ONLY valid JSON: {{"Ingredient Name": "Brief description"}}"""
+            
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": "You are an ingredient analyst. Output valid JSON only."
+                    },
+                    {"role": "user", "content": safe_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=1500,
+                response_format={"type": "json_object"}
+            )
+            
+            content = response.choices[0].message.content.strip()
+            return json.loads(content)
+            
+        except Exception as e:
+            logger.error(f"Async safe descriptions failed: {e}")
+            return {ing: "Common ingredient in consumer products." for ing in safe_ingredients}
+    
+    return await asyncio.get_event_loop().run_in_executor(None, _sync_generate)
+
+
+async def _analyze_packaging_async(
+    packaging_text: str, 
+    packaging_tags: list,
+    normalized_materials: list = None,
+    brand_name: str = None,
+    product_name: str = None,
+    categories: str = None
+) -> dict:
+    """
+    Async version of packaging analysis.
+    Runs in thread pool to avoid blocking.
+    """
+    if not packaging_text and not packaging_tags and not normalized_materials:
+        return {
+            "materials": [],
+            "analysis": {},
+            "overall_safety": "unknown",
+            "summary": "No packaging information available"
+        }
+    
+    def _sync_analyze():
+        try:
+            if normalized_materials:
+                materials = normalized_materials
+            else:
+                materials = packaging_tags if packaging_tags else [packaging_text]
+            
+            packaging_info = f"Packaging: {packaging_text}. Tags: {', '.join(packaging_tags)}" if packaging_tags else packaging_text
+            
+            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+            
+            context_parts = []
+            if brand_name:
+                context_parts.append(f"Brand: {brand_name}")
+            if product_name:
+                context_parts.append(f"Product: {product_name}")
+            if categories:
+                main_category = categories.split(",")[0].strip() if "," in categories else categories
+                context_parts.append(f"Category: {main_category}")
+            
+            product_context = "\n".join(context_parts) if context_parts else "Product context not available"
+            
+            prompt = f"""Analyze these packaging materials for health and environmental impact.
+
+PRODUCT CONTEXT:
+{product_context}
+
+PACKAGING INFO:
+{packaging_info}
+Materials: {', '.join(materials)}
+
+For EACH material provide:
+- description: what it is and why it's used
+- harmful: true/false
+- health_concerns: specific risks
+- environmental_impact: recyclability, pollution
+- severity: low/moderate/high/critical
+
+Format as JSON:
+{{
+    "materials": {json.dumps(materials)},
+    "analysis": {{"Material": {{"description": "...", "harmful": false, "health_concerns": "...", "environmental_impact": "...", "severity": "low"}}}},
+    "overall_safety": "safe/caution/harmful",
+    "summary": "2-3 sentence assessment"
+}}"""
+            
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a packaging safety expert. Return valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=1000,
+                response_format={"type": "json_object"}
+            )
+            
+            content = response.choices[0].message.content.strip()
+            return json.loads(content)
+            
+        except Exception as e:
+            logger.error(f"Async packaging analysis failed: {e}")
+            return {
+                "materials": ["unknown"],
+                "analysis": {},
+                "overall_safety": "unknown",
+                "summary": "Unable to analyze packaging"
+            }
+    
+    return await asyncio.get_event_loop().run_in_executor(None, _sync_analyze)
+
+
+async def get_ingredient_descriptions_parallel(
+    safe_ingredients: list,
+    harmful_ingredients: list,
+    harmful_chemicals_db: list
+) -> dict:
+    """
+    Generate ingredient descriptions in PARALLEL (harmful + safe simultaneously).
+    This is ~2x faster than sequential generation.
+    """
+    logger.info(f"[PARALLEL] Starting parallel description generation: {len(harmful_ingredients)} harmful, {len(safe_ingredients)} safe")
+    
+    # Run both description generations in parallel
+    harmful_task = _generate_harmful_descriptions_async(harmful_ingredients, harmful_chemicals_db)
+    safe_task = _generate_safe_descriptions_async(safe_ingredients)
+    
+    harmful_desc, safe_desc = await asyncio.gather(harmful_task, safe_task)
+    
+    logger.info(f"[PARALLEL] Completed: {len(harmful_desc)} harmful, {len(safe_desc)} safe descriptions")
+    
+    return {
+        "safe": safe_desc,
+        "harmful": harmful_desc
+    }
+
+
 def analyze_packaging_material(
     packaging_text: str, 
     packaging_tags: list, 
@@ -1674,26 +1914,11 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
             "harmful_count": len(harmful_chemicals),
         }
         
-        # Generate detailed AI ingredient descriptions (safe + harmful)
-        if harmful_ingredient_names or safe_ingredient_names:
-            # Generate detailed descriptions using AI-separated lists
-            ingredient_descriptions = get_detailed_ingredient_descriptions(
-                safe_ingredients=safe_ingredient_names,
-                harmful_ingredients=harmful_ingredient_names,
-                harmful_chemicals_db=harmful_chemicals
-            )
-            product_data["ingredient_descriptions"] = ingredient_descriptions
-            
-            # Store separated lists (no duplicates - AI handles the separation)
-            product_data["ingredients"] = safe_ingredient_names  # Only safe ingredients
-            product_data["harmful_ingredients"] = harmful_ingredient_names  # Only harmful ingredients
-        else:
-            product_data["ingredient_descriptions"] = {"safe": {}, "harmful": {}}
-            product_data["ingredients"] = []
-            product_data["harmful_ingredients"] = []
+        # Store separated lists (no duplicates - AI handles the separation)
+        product_data["ingredients"] = safe_ingredient_names
+        product_data["harmful_ingredients"] = harmful_ingredient_names
         
-        # Analyze packaging materials with AI
-        # Extract packaging from the correct location (might be in materials object)
+        # === EXTRACT PACKAGING INFO BEFORE PARALLEL EXECUTION ===
         packaging_text = product_data.get("packaging", "")
         packaging_tags = product_data.get("packaging_tags", [])
         
@@ -1705,7 +1930,7 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
         
         logger.info(f"Packaging text: '{packaging_text}', Tags: {packaging_tags}")
         
-        # === INFER PACKAGING IF MISSING (INDEPENDENT OF INGREDIENT INFERENCE) ===
+        # === INFER PACKAGING IF MISSING (before parallel execution) ===
         if not packaging_text and not packaging_tags:
             logger.info("No packaging data in OpenFacts - attempting to find packaging info")
             
@@ -1721,7 +1946,7 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
                 packaging_source = "web_search"
                 logger.info(f"Using web-searched packaging: {packaging_text}")
             
-            # Strategy 2: AI inference based on category (always provide something)
+            # Strategy 2: AI inference based on category
             else:
                 category = product_data.get("categories", "").split(",")[0] if product_data.get("categories") else "General product"
                 packaging_inference = await infer_packaging_from_category(
@@ -1733,20 +1958,77 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
                     packaging_source = "ai_inferred"
                     logger.info(f"Using category-based packaging inference: {packaging_text}")
         
+        # === PARALLEL EXECUTION: Run ingredient descriptions + packaging analysis simultaneously ===
+        logger.info(f"[PARALLEL] Starting parallel AI analysis...")
+        
+        # Prepare tasks
+        tasks = []
+        
+        # Task 1: Ingredient descriptions (if we have ingredients)
+        if harmful_ingredient_names or safe_ingredient_names:
+            ingredient_task = get_ingredient_descriptions_parallel(
+                safe_ingredients=safe_ingredient_names,
+                harmful_ingredients=harmful_ingredient_names,
+                harmful_chemicals_db=harmful_chemicals
+            )
+            tasks.append(("ingredients", ingredient_task))
+        
+        # Task 2: Packaging analysis (if we have packaging info)
         if packaging_text or packaging_tags:
-            logger.info(f"Analyzing packaging materials: {packaging_text}")
-            packaging_analysis = analyze_packaging_material(packaging_text, packaging_tags)
-            product_data["packaging_analysis"] = packaging_analysis
-            logger.info(f"Packaging analysis complete: {len(packaging_analysis.get('materials', []))} materials identified")
+            packaging_task = _analyze_packaging_async(
+                packaging_text=packaging_text,
+                packaging_tags=packaging_tags,
+                brand_name=product_data.get("brands"),
+                product_name=product_data.get("name"),
+                categories=product_data.get("categories")
+            )
+            tasks.append(("packaging", packaging_task))
+        
+        # Execute all tasks in parallel
+        if tasks:
+            task_names = [t[0] for t in tasks]
+            task_coroutines = [t[1] for t in tasks]
+            
+            logger.info(f"[PARALLEL] Executing {len(tasks)} tasks in parallel: {task_names}")
+            results = await asyncio.gather(*task_coroutines, return_exceptions=True)
+            
+            # Process results
+            for i, (name, _) in enumerate(tasks):
+                result = results[i]
+                if isinstance(result, Exception):
+                    logger.error(f"[PARALLEL] Task '{name}' failed: {result}")
+                    if name == "ingredients":
+                        product_data["ingredient_descriptions"] = {"safe": {}, "harmful": {}}
+                    elif name == "packaging":
+                        product_data["packaging_analysis"] = {
+                            "materials": [],
+                            "analysis": {},
+                            "overall_safety": "unknown",
+                            "summary": "Packaging analysis failed"
+                        }
+                else:
+                    if name == "ingredients":
+                        product_data["ingredient_descriptions"] = result
+                        logger.info(f"[PARALLEL] Ingredient descriptions complete")
+                    elif name == "packaging":
+                        product_data["packaging_analysis"] = result
+                        logger.info(f"[PARALLEL] Packaging analysis complete: {len(result.get('materials', []))} materials")
+            
+            logger.info(f"[PARALLEL] All tasks completed!")
         else:
-            logger.info("No packaging information available")
-            packaging_source = "none"
+            # No tasks to run - set defaults
+            product_data["ingredient_descriptions"] = {"safe": {}, "harmful": {}}
             product_data["packaging_analysis"] = {
                 "materials": [],
                 "analysis": {},
                 "overall_safety": "unknown",
                 "summary": "No packaging information available"
             }
+            packaging_source = "none"
+        
+        # Set packaging_source to none if no packaging was analyzed
+        if not packaging_text and not packaging_tags:
+            packaging_source = "none"
         
         # === ADD ANALYSIS METADATA FOR TRANSPARENCY ===
         data_quality_score = 100
