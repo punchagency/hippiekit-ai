@@ -15,6 +15,7 @@ load_dotenv()
 from routers import scan_router, index_router
 from routers.identify import router as identify_router
 from services.cache_service import cache_service
+from models.clip_embedder import get_clip_embedder
 
 
 # === Request Timing Logger Middleware ===
@@ -87,6 +88,18 @@ async def lifespan(app: FastAPI):
     """Lifecycle manager for startup and shutdown events"""
     # Startup: Connect to Redis
     await cache_service.connect()
+    
+    # Startup: Pre-load CLIP model (avoids 15s cold start on first request!)
+    # Note: First-ever run will download model (~500MB) from HuggingFace Hub
+    # Subsequent runs load from cache (~/.cache/huggingface/hub/)
+    print("🧠 Pre-loading CLIP model at startup (may download on first run)...")
+    try:
+        get_clip_embedder()
+        print("✅ CLIP model ready!")
+    except Exception as e:
+        print(f"⚠️ CLIP model failed to load: {e}")
+        print("   Recommendations endpoint may not work until model is available")
+    
     yield
     # Shutdown: Close Redis connection
     await cache_service.disconnect()
@@ -145,9 +158,9 @@ if __name__ == "__main__":
     ╔═══════════════════════════════════════════════════╗
     ║     Hippiekit AI Service Starting...              ║
     ╠═══════════════════════════════════════════════════╣
-    ║  • Loading CLIP model (this may take a moment)   ║
+    ║  • Loading CLIP model (this may take a moment)    ║
     ║  • Connecting to Pinecone                         ║
-    ║  • Starting server on port {port}                    ║
+    ║  • Starting server on port {port}                 ║
     ╚═══════════════════════════════════════════════════╝
     """)
     

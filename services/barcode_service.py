@@ -78,7 +78,9 @@ class BarcodeService:
     
     async def _fetch_from_databases(self, barcode: str) -> Optional[Dict[str, Any]]:
         """
-        Fetch product data from Open*Facts databases in parallel
+        Fetch product data from Open*Facts databases in parallel.
+        OPTIMIZED: Waits for all results and picks the BEST quality data.
+        Prioritizes Open*Facts databases over UPCItemDB.
         
         Args:
             barcode: Product barcode
@@ -86,7 +88,7 @@ class BarcodeService:
         Returns:
             Normalized product data or None if not found
         """
-        # Database configurations
+        # Database configurations - Open*Facts first (better data quality)
         databases = [
             ("OpenFoodFacts", self.OPENFOODFACTS_API.format(barcode=barcode)),
             ("OpenBeautyFacts", self.OPENBEAUTYFACTS_API.format(barcode=barcode)),
@@ -100,20 +102,98 @@ class BarcodeService:
             for db_name, url in databases
         ]
         
-        # Wait for first successful result
-        for task in asyncio.as_completed(tasks):
-            try:
-                db_name, product_data = await task
-                if product_data:
-                    logger.info(f"Product found in {db_name}")
-                    normalized = await self._normalize_product_data(product_data, db_name)
-                    return normalized
-            except Exception as e:
-                logger.warning(f"Error in parallel query: {str(e)}")
+        # Wait for ALL results (with timeout) and pick the best one
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Score each result and pick the best
+        best_result = None
+        best_score = -1
+        best_db = None
+        
+        for result in results:
+            if isinstance(result, Exception):
                 continue
+            
+            db_name, product_data = result
+            if not product_data:
+                continue
+            
+            # Score the result based on data quality
+            score = self._score_product_data(product_data, db_name)
+            logger.info(f"Product found in {db_name} with quality score: {score}")
+            
+            if score > best_score:
+                best_score = score
+                best_result = product_data
+                best_db = db_name
+        
+        if best_result:
+            logger.info(f"Selected best result from {best_db} (score: {best_score})")
+            return await self._normalize_product_data(best_result, best_db)
         
         logger.info(f"Product not found in any database for barcode: {barcode}")
         return None
+    
+    def _score_product_data(self, product_data: Dict[str, Any], db_name: str) -> int:
+        """
+        Score product data quality. Higher score = better data.
+        Open*Facts databases get bonus points.
+        
+        Args:
+            product_data: Raw product data from API
+            db_name: Source database name
+            
+        Returns:
+            Quality score (higher is better)
+        """
+        score = 0
+        
+        # Database priority bonus (Open*Facts > UPCItemDB)
+        db_priority = {
+            "OpenFoodFacts": 50,
+            "OpenBeautyFacts": 45,
+            "OpenProductsFacts": 40,
+            "UPCItemDB": 10,  # Much lower priority - often has bad data
+        }
+        score += db_priority.get(db_name, 0)
+        
+        # Has product name (+20)
+        if db_name == "UPCItemDB":
+            name = product_data.get("title", "")
+        else:
+            name = product_data.get("product_name", "") or product_data.get("product_name_en", "")
+        if name and len(name) > 3:
+            score += 20
+        
+        # Has brand (+15)
+        brand = product_data.get("brand", "") or product_data.get("brands", "")
+        if brand and len(brand) > 1:
+            score += 15
+        
+        # Has ingredients (+30 - most important!)
+        if db_name == "UPCItemDB":
+            has_ingredients = False  # UPCItemDB doesn't have ingredients
+        else:
+            ingredients_text = product_data.get("ingredients_text", "") or product_data.get("ingredients_text_en", "")
+            has_ingredients = ingredients_text and len(ingredients_text) > 10
+        if has_ingredients:
+            score += 30
+        
+        # Has image (+10)
+        if db_name == "UPCItemDB":
+            has_image = product_data.get("images") and len(product_data.get("images", [])) > 0
+        else:
+            has_image = product_data.get("image_url") or product_data.get("image_front_url")
+        if has_image:
+            score += 10
+        
+        # Has valid category (+10) - UPCItemDB often has wrong categories
+        if db_name != "UPCItemDB":
+            categories = product_data.get("categories", "")
+            if categories and "Media" not in categories and "DVDs" not in categories:
+                score += 10
+        
+        return score
     
     async def _query_api_async(self, url: str, db_name: str) -> tuple[str, Optional[Dict[str, Any]]]:
         """

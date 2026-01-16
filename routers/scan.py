@@ -985,13 +985,16 @@ Now generate {count} alternatives for "{product_name}" (category: {category}):""
         
         alternatives = json.loads(content)
         
-        # Add type marker and fetch brand logos
+        # Add type marker and fetch brand logos IN PARALLEL
         from services.web_search_service import web_search_service
         
+        # Mark all as AI generated first
         for alt in alternatives:
             alt["type"] = "ai_generated"
-            
-            # Fetch brand logo asynchronously
+        
+        # Fetch all logos in parallel using asyncio.gather
+        async def fetch_logo_for_alt(alt: dict) -> None:
+            """Fetch logo for a single alternative (mutates alt dict)"""
             brand_name = alt.get("brand", "")
             if brand_name:
                 try:
@@ -1004,7 +1007,10 @@ Now generate {count} alternatives for "{product_name}" (category: {category}):""
                 except Exception as e:
                     logger.error(f"[LOGO] Error fetching logo for {brand_name}: {e}")
         
-        logger.info(f"Generated {len(alternatives)} AI product alternatives with logos")
+        # Run all logo fetches in parallel
+        await asyncio.gather(*[fetch_logo_for_alt(alt) for alt in alternatives], return_exceptions=True)
+        
+        logger.info(f"Generated {len(alternatives)} AI product alternatives with logos (parallel fetch)")
         return alternatives
         
     except Exception as e:
@@ -1157,8 +1163,7 @@ def get_detailed_ingredient_descriptions(
     """
     Generate detailed, user-friendly AI descriptions for ALREADY SEPARATED ingredients.
     
-    CRITICAL: This function receives ingredients that have ALREADY been separated by AI.
-    Do NOT re-separate them here.
+    OPTIMIZED: Uses a SINGLE batched OpenAI API call for both harmful and safe ingredients.
     
     Args:
         safe_ingredients: List of safe ingredient names (from AI separation)
@@ -1172,174 +1177,95 @@ def get_detailed_ingredient_descriptions(
         }
     """
     try:
-        # Build harmful descriptions - explain what it is AND why it's harmful
-        harmful_descriptions = {}
-        if harmful_ingredients:
-            try:
-                client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-                
-                # Find database info for harmful ingredients
-                harmful_items = []
-                for ing_name in harmful_ingredients[:15]:  # Limit to avoid token limits
-                    # Try to find this ingredient in the database for context
-                    db_info = None
-                    for chem in harmful_chemicals_db:
-                        if chem.get('name', '').lower() == ing_name.lower():
-                            db_info = chem
-                            break
-                    
-                    if db_info:
-                        harmful_items.append(f"{ing_name} (Category: {db_info.get('category', 'unknown')})")
-                    else:
-                        harmful_items.append(f"{ing_name} (AI flagged as harmful)")
-                
-                harmful_str = ", ".join(harmful_items)
-                
-                harmful_prompt = f"""Analyze these harmful chemicals/ingredients found in a consumer product.
+        # If no ingredients to describe, return early
+        if not harmful_ingredients and not safe_ingredients:
+            return {"safe": {}, "harmful": {}}
+        
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
+        # Build harmful items with context
+        harmful_items = []
+        for ing_name in harmful_ingredients[:15]:  # Limit to avoid token limits
+            db_info = None
+            for chem in harmful_chemicals_db:
+                if chem.get('name', '').lower() == ing_name.lower():
+                    db_info = chem
+                    break
+            
+            if db_info:
+                harmful_items.append(f"{ing_name} (Category: {db_info.get('category', 'unknown')})")
+            else:
+                harmful_items.append(f"{ing_name} (AI flagged as harmful)")
+        
+        harmful_str = ", ".join(harmful_items) if harmful_items else "None"
+        safe_str = ", ".join(safe_ingredients[:20]) if safe_ingredients else "None"
+        
+        logger.info(f"[BATCHED] Generating descriptions for {len(harmful_ingredients)} harmful + {len(safe_ingredients)} safe ingredients in ONE API call")
+        
+        # SINGLE BATCHED PROMPT for both harmful and safe
+        batched_prompt = f"""Analyze these ingredients from a consumer product. Provide descriptions for BOTH harmful AND safe ingredients in a single response.
 
-FLAGGED CHEMICALS (authoritative — do not dispute or soften):
+=== HARMFUL INGREDIENTS (be critical, explain dangers) ===
 {harmful_str}
 
-For each chemical, provide a description that:
-1. States what the chemical is and its industrial/synthetic use in consumer products (food, beauty, cleaning, etc.)
-2. Explains why it's harmful to human health and/or the environment from a clean/natural product perspective
-3. Calls out specific health risks, toxicity concerns, or environmental damage
-4. Uses clear, direct language - no corporate apologetics or "generally regarded as safe" phrases
+=== SAFE INGREDIENTS (be educational, honest about processing) ===
+{safe_str}
 
-CRITICAL RULES:
-• These ingredients are FLAGGED for a reason - do not defend them
-• If it's synthetic, lab-derived, or industrially processed, emphasize that
-• E-numbers should be called out as synthetic petroleum-based additives
-• Dyes, artificial flavors, and preservatives are always problematic
-• Never say "safe in small amounts" or cite regulatory approval as reassurance
-• Assume worst-case origin (synthetic) unless explicitly stated as natural
+INSTRUCTIONS:
+1. For HARMFUL ingredients: Explain what it is, why it's harmful, health/environmental risks. Be uncompromising.
+2. For SAFE ingredients: Brief 1-2 sentence educational description. Natural = positive, processed = honest critique.
+3. Use exact ingredient names as JSON keys.
 
-Format as JSON: {{"Chemical Name Exactly As Listed": "critical description"}}
+Return ONLY this JSON structure:
+{{
+    "harmful": {{
+        "Ingredient Name": "Critical description of why this is harmful..."
+    }},
+    "safe": {{
+        "Ingredient Name": "Brief educational description..."
+    }}
+}}"""
 
-Harmful chemicals: {harmful_str}"""
-                
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {
-                            "role": "system", 
-                            "content": """You are a strict, anti-synthetic ingredient auditor for ALL consumer products (food, beauty, cleaning, personal care).
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": """You are a strict ingredient auditor for consumer products with a clean/natural product philosophy.
 
-Your philosophy:
-• If an ingredient is synthetic, industrially processed, artificial, or ambiguous — it is a red flag.
-• You strongly favor natural, recognizable, minimally processed ingredients.
-• You do NOT give manufacturers the benefit of the doubt.
-• You NEVER reclassify or soften ingredients already flagged by the chemical detection system.
-• "Natural flavor", "fragrances", "parfum", E-numbers, dyes, modified compounds, emulsifiers, preservatives, or lab-derived ingredients are treated as harmful unless explicitly natural/organic.
+For HARMFUL ingredients:
+• Be uncompromising - these are flagged for a reason
+• Call out synthetic, industrial, and processed origins
+• Never say "safe in small amounts" or cite regulatory approval
+• E-numbers, dyes, artificial flavors = always problematic
 
-Rules you MUST follow:
-1. If an ingredient matches a flagged chemical, you MUST mark it as harmful and explain why.
-2. If an ingredient is vague or non-specific (e.g. "flavourings", "colors"), assume it hides synthetic additives.
-3. If an ingredient is technically allowed but highly processed, call it out as "industrial/ultra-processed".
-4. Never say "generally regarded as safe" or cite regulatory approval as reassurance.
-5. If an ingredient can be either natural or synthetic, assume it is synthetic unless the label explicitly states otherwise.
-6. Favor short ingredient lists with recognizable whole foods.
-7. If unsure, err on the side of caution and flag it.
-
-Tone: Calm, grounded, honest, but uncompromising. You are an ingredient auditor who cares about clean products, not industry profits.
-
-Output must be valid JSON only. Always use the exact chemical names provided as JSON keys without modification."""
-                        },
-                        {"role": "user", "content": harmful_prompt}
-                    ],
-                    temperature=0.3,
-                    max_tokens=1500
-                )
-                
-                content = response.choices[0].message.content.strip()
-                logger.info(f"Raw AI response for harmful chemicals: {content[:500]}...")
-                
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
-                
-                harmful_descriptions = json.loads(content)
-                logger.info(f"Generated detailed descriptions for {len(harmful_descriptions)} harmful chemicals")
-                
-            except Exception as e:
-                logger.error(f"Failed to generate harmful chemical descriptions: {e}", exc_info=True)
-                # Fallback to basic descriptions
-                for ing_name in harmful_ingredients:
-                    harmful_descriptions[ing_name] = f"This ingredient has been flagged as potentially harmful. It may be synthetic, ultra-processed, or pose health and environmental risks."
-        
-        # Generate safe ingredient descriptions with strict clean product perspective
-        safe_descriptions = {}
-        if safe_ingredients:
-            try:
-                client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-                
-                # Process all ingredients (no limit)
-                ingredients_str = ", ".join(safe_ingredients)
-                logger.info(f"Generating descriptions for {len(safe_ingredients)} safe ingredients")
-                
-                safe_prompt = f"""Analyze these safe/common ingredients found in a consumer product (food, beauty, cleaning, personal care) from a clean/natural product perspective.
-
-INGREDIENTS TO DESCRIBE:
-{ingredients_str}
-
-For each ingredient, provide a brief, educational description (1-2 sentences) that:
-1. Explains what the ingredient is (natural vs processed vs synthetic)
-2. States its primary purpose/function in consumer products
-3. Offers a grounded perspective (is it beneficial, neutral, or concerning?)
-4. Mentions any processing concerns if it's refined/industrial
-
-Guidelines:
-• Be honest about ultra-processed ingredients (refined sugar, synthetic fragrances, harsh chemicals, industrial oils)
-• Don't give processed products a free pass just because they're "safe"
-• Natural ingredients get positive descriptions, ultra-processed get honest critique
+For SAFE ingredients:
+• Natural = positive descriptions
+• Ultra-processed = honest critique
 • Keep it educational, not alarmist
 
-Tone: Educational, honest, grounded in clean/natural product philosophy. Not alarmist, but don't sugarcoat industrial processing.
-
-Return ONLY valid JSON with ingredient names as keys and simple string descriptions as values:
-{{"Ingredient Name": "Brief 1-2 sentence description"}}
-
-Ingredients: {ingredients_str}"""
-                
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {
-                            "role": "system", 
-                            "content": """You are an ingredient analyst for consumer products (food, beauty, cleaning, personal care) with a clean/natural product philosophy.
-
-Your perspective:
-• Natural, unprocessed ingredients = good
-• Refined, industrial, synthetic ingredients = problematic but honest
-• Ultra-processed ingredients deserve honest critique
-• Refined sweeteners, synthetic fragrances, harsh chemicals = concerning
-• If something can be natural or synthetic, assume synthetic unless stated
-
-Output ONLY valid JSON with ingredient names as keys and simple string descriptions as values.
-Example: {"Sugar": "Refined white sugar is an ultra-processed sweetener that spikes blood sugar."}"""
-                        },
-                        {"role": "user", "content": safe_prompt}
-                    ],
-                    temperature=0.3,
-                    max_tokens=2500
-                )
-                
-                content = response.choices[0].message.content.strip()
-                logger.info(f"Raw AI response for safe ingredients: {content[:500]}...")
-                
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
-                
-                safe_descriptions = json.loads(content)
-                logger.info(f"Generated detailed descriptions for {len(safe_descriptions)} safe ingredients")
-                
-            except Exception as e:
-                logger.error(f"Failed to generate safe ingredient descriptions: {e}", exc_info=True)
-                # Create fallback descriptions for ALL ingredients
-                safe_descriptions = {ing: "Common ingredient used in food and personal care products." for ing in safe_ingredients}
+Output ONLY valid JSON with the exact structure requested."""
+                },
+                {"role": "user", "content": batched_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=3000
+        )
+        
+        content = response.choices[0].message.content.strip()
+        logger.info(f"[BATCHED] Raw AI response: {content[:300]}...")
+        
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        
+        result = json.loads(content)
+        
+        harmful_descriptions = result.get("harmful", {})
+        safe_descriptions = result.get("safe", {})
+        
+        logger.info(f"[BATCHED] Generated {len(harmful_descriptions)} harmful + {len(safe_descriptions)} safe descriptions in ONE call")
         
         return {
             "safe": safe_descriptions,
@@ -1347,8 +1273,11 @@ Example: {"Sugar": "Refined white sugar is an ultra-processed sweetener that spi
         }
         
     except Exception as e:
-        logger.error(f"Error in get_detailed_ingredient_descriptions: {e}")
-        return {"safe": {}, "harmful": {}}
+        logger.error(f"Error in get_detailed_ingredient_descriptions (batched): {e}", exc_info=True)
+        # Fallback to basic descriptions
+        harmful_descriptions = {ing: "This ingredient has been flagged as potentially harmful." for ing in harmful_ingredients}
+        safe_descriptions = {ing: "Common ingredient used in consumer products." for ing in safe_ingredients}
+        return {"safe": safe_descriptions, "harmful": harmful_descriptions}
 
 
 # === ASYNC PARALLEL VERSIONS FOR OPTIMIZED PERFORMANCE ===

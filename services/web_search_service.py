@@ -191,7 +191,7 @@ Instructions:
             encoded_brand_name = quote(brand_name, safe='')
             search_url = f"https://api.brandfetch.io/v2/search/{encoded_brand_name}"
             
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=5.0) as client:  # 5s is best practice for simple lookups
                 # Search for brand (no API key needed for search)
                 search_response = await client.get(search_url)
                 
