@@ -29,6 +29,7 @@ class CacheService:
         # Cache TTL (7 days for barcode data - products rarely change)
         self.barcode_ttl = 604800  # 7 days in seconds
         self.product_ttl = 86400    # 1 day for product identification results
+        self.ingredients_ttl = 604800  # 7 days for ingredient lookups
         
         logger.info(f"Cache service initialized (Redis: {redis_host}:{redis_port})")
     
@@ -135,6 +136,77 @@ class CacheService:
             
         except Exception as e:
             logger.error(f"Cache invalidation error: {str(e)}")
+            return False
+    
+    def _make_ingredients_key(self, product_name: str, brand: str, category: str) -> str:
+        """Generate cache key for ingredient lookups"""
+        # Normalize the key components - use only product name and brand (category can vary between scans)
+        normalized = f"{product_name.lower().strip()}:{brand.lower().strip()}"
+        return f"ingredients:{normalized}"
+    
+    async def get_ingredients(self, product_name: str, brand: str, category: str) -> Optional[Dict[str, Any]]:
+        """
+        Get cached ingredient separation result
+        
+        Args:
+            product_name: Product name
+            brand: Brand name
+            category: Product category
+            
+        Returns:
+            Cached ingredient data or None if not found
+        """
+        if not self.redis_client:
+            logger.warning(f"Redis not connected - skipping ingredient cache lookup")
+            return None
+        
+        try:
+            cache_key = self._make_ingredients_key(product_name, brand, category)
+            cached_data = await self.redis_client.get(cache_key)
+            
+            if cached_data:
+                logger.info(f"Cache HIT for ingredients: {brand} {product_name}")
+                return json.loads(cached_data)
+            else:
+                logger.info(f"Cache MISS for ingredients: {brand} {product_name}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Ingredient cache get error: {str(e)}")
+            return None
+    
+    async def set_ingredients(self, product_name: str, brand: str, category: str, data: Dict[str, Any]) -> bool:
+        """
+        Cache ingredient separation result
+        
+        Args:
+            product_name: Product name
+            brand: Brand name  
+            category: Product category
+            data: Ingredient data to cache
+            
+        Returns:
+            True if cached successfully, False otherwise
+        """
+        if not self.redis_client:
+            logger.warning(f"Redis not connected - cannot cache ingredients")
+            return False
+        
+        try:
+            cache_key = self._make_ingredients_key(product_name, brand, category)
+            serialized_data = json.dumps(data)
+            
+            await self.redis_client.setex(
+                cache_key,
+                self.ingredients_ttl,
+                serialized_data
+            )
+            
+            logger.info(f"Cached ingredients for: {brand} {product_name} (TTL: {self.ingredients_ttl}s)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ingredient cache set error: {str(e)}")
             return False
     
     async def get_stats(self) -> Dict[str, Any]:

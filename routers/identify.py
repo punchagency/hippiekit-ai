@@ -9,6 +9,7 @@ from services.vision_service import get_vision_service
 from services.barcode_service import BarcodeService
 from services.web_search_service import web_search_service
 from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations
+from services.cache_service import cache_service
 from routers.scan import get_detailed_ingredient_descriptions, analyze_packaging_material, separate_ingredients_with_ai, infer_packaging_from_category, search_ingredients_from_context, infer_ingredients_from_category
 from openai import OpenAI
 import os
@@ -643,9 +644,10 @@ async def separate_photo_ingredients(
     """
     Step 2: Separate ingredients into harmful/safe
     Uses smart strategy:
-    - AI inference runs first (1-2s) - works for well-known products
-    - ONLY use AI if confidence is HIGH (no hallucination for ingredients!)
-    - If AI returns medium/low/empty, fall back to web search
+    - Check cache first (instant, consistent results)
+    - If brand is known: AI inference first (fast, accurate for known products)
+    - If brand is unknown/not visible: Web search first (AI can't know specific formulation)
+    - Fallback chain ensures we always try to get data
     
     Returns just the ingredient names, descriptions come later
     """
@@ -654,33 +656,48 @@ async def separate_photo_ingredients(
     try:
         logger.info(f"Separating ingredients for: {brand} {product_name}")
         
-        # PRIMARY: AI inference without web search (FASTEST - 1-2s)
-        logger.info(f"Inferring ingredients from AI knowledge")
-        inferred_result = await infer_ingredients_from_category(
-            product_name=product_name,
-            brand=brand,
-            category=category or ''
-        )
+        # CHECK CACHE FIRST - ensures consistent results for same product
+        cached_result = await cache_service.get_ingredients(product_name, brand, category)
+        if cached_result:
+            elapsed_time = time.time() - start_time
+            logger.info(f"⚡ Cache hit for ingredients: {brand} {product_name}")
+            cached_result["_elapsed_time"] = round(elapsed_time, 2)
+            cached_result["_cached"] = True
+            return cached_result
         
         ingredients_text = ""
-        data_source = "ai_inference"
+        data_source = "none"
         
-        # Check if AI returned any high-confidence ingredients
-        # The inference function now filters per-ingredient, only returning HIGH confidence ones
-        ai_ingredients = inferred_result.get('likely_ingredients', []) if inferred_result else []
+        # Check if we have a real brand name (not empty, "Not visible", "Unknown", etc.)
+        brand_is_known = brand and brand.lower() not in ["", "not visible", "unknown", "none", "n/a"]
         
-        if ai_ingredients:
-            # AI returned high-confidence ingredients - use them (skip web search!)
-            ingredients_text = ', '.join(ai_ingredients)
-            data_source = 'ai_inference (high confidence)'
-            logger.info(f"✅ AI inference succeeded with {len(ai_ingredients)} HIGH confidence ingredients")
-        else:
-            # No high-confidence ingredients - need web search
-            logger.info(f"AI inference returned no HIGH confidence ingredients, falling back to web search")
-            
-            web_result = await web_search_service.search_product_ingredients(
+        if brand_is_known:
+            # STRATEGY A: Brand is known → AI inference first (fast for known products)
+            logger.info(f"Brand '{brand}' is known - trying AI inference first")
+            inferred_result = await infer_ingredients_from_category(
                 product_name=product_name,
                 brand=brand,
+                category=category or ''
+            )
+            
+            ai_ingredients = inferred_result.get('likely_ingredients', []) if inferred_result else []
+            
+            if ai_ingredients:
+                ingredients_text = ', '.join(ai_ingredients)
+                data_source = 'ai_inference (high confidence)'
+                logger.info(f"✅ AI inference succeeded with {len(ai_ingredients)} HIGH/MEDIUM confidence ingredients")
+            else:
+                logger.info(f"AI inference returned no confident ingredients, falling back to web search")
+        else:
+            # STRATEGY B: Brand unknown → Skip AI (it can only guess generic ingredients)
+            logger.info(f"Brand not visible/unknown - skipping AI inference, using web search directly")
+        
+        # If we don't have ingredients yet (AI failed or was skipped), try web search
+        if not ingredients_text:
+            logger.info(f"Trying web search for ingredients...")
+            web_result = await web_search_service.search_product_ingredients(
+                product_name=product_name,
+                brand=brand if brand_is_known else "",  # Don't send "Not visible" as brand
                 category=category
             )
             
@@ -693,7 +710,7 @@ async def separate_photo_ingredients(
                 logger.warning(f"Primary web search failed, trying context search")
                 search_result = await search_ingredients_from_context(
                     product_name=product_name,
-                    brand=brand,
+                    brand=brand if brand_is_known else "",
                     category=category or ''
                 )
                 
@@ -702,14 +719,29 @@ async def separate_photo_ingredients(
                     data_source = 'web_search_context'
                     logger.info(f"Found {len(search_result['likely_ingredients'])} ingredients via context search")
                 else:
-                    # If all methods fail, return empty
-                    logger.warning(f"Could not find or infer ingredients for {brand} {product_name}")
-                    return {
-                        "harmful": [],
-                        "safe": [],
-                        "data_source": "none",
-                        "message": "Could not find ingredient information"
-                    }
+                    # LAST RESORT: If brand unknown and web search failed, try AI anyway
+                    if not brand_is_known:
+                        logger.info(f"Web search failed for unknown brand, trying AI inference as last resort")
+                        inferred_result = await infer_ingredients_from_category(
+                            product_name=product_name,
+                            brand="",
+                            category=category or ''
+                        )
+                        ai_ingredients = inferred_result.get('likely_ingredients', []) if inferred_result else []
+                        if ai_ingredients:
+                            ingredients_text = ', '.join(ai_ingredients)
+                            data_source = 'ai_inference (generic product)'
+                            logger.info(f"AI inference returned {len(ai_ingredients)} ingredients as last resort")
+                    
+                    # If still no ingredients, return empty
+                    if not ingredients_text:
+                        logger.warning(f"Could not find or infer ingredients for {brand} {product_name}")
+                        return {
+                            "harmful": [],
+                            "safe": [],
+                            "data_source": "none",
+                            "message": "Could not find ingredient information"
+                        }
         
         # Check for harmful chemicals
         chemical_flags = check_ingredients(ingredients_text)
@@ -721,13 +753,19 @@ async def separate_photo_ingredients(
         logger.info(f"Separated: {len(separated.get('harmful', []))} harmful, {len(separated.get('safe', []))} safe")
         logger.info(f"⏱️ /ingredients/separate completed in {elapsed_time:.2f}s")
         
-        return {
+        # Build result
+        result = {
             "harmful": separated.get("harmful", []),
             "safe": separated.get("safe", []),
             "data_source": data_source,
             "ingredients_text": ingredients_text,  # Return for future calls
             "_elapsed_time": round(elapsed_time, 2)
         }
+        
+        # CACHE THE RESULT for consistent future lookups
+        await cache_service.set_ingredients(product_name, brand, category, result)
+        
+        return result
         
     except Exception as e:
         elapsed_time = time.time() - start_time

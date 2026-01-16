@@ -152,8 +152,8 @@ async def infer_ingredients_from_category(
         category: Product category
         
     Returns:
-        Dictionary with AI-inferred ingredients (only high confidence ones)
-        Format: {"likely_ingredients": ["ingredient1", "ingredient2", ...], "confidence": "high"}
+        Dictionary with AI-inferred ingredients (high and medium confidence ones)
+        Format: {"likely_ingredients": ["ingredient1", "ingredient2", ...], "confidence": "high|medium"}
     """
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -165,23 +165,25 @@ Brand: {brand}
 Category: {category}
 
 INSTRUCTIONS:
-1. For each ingredient, rate your confidence: "high" (you KNOW this is in the product) or "low" (guessing/inferring)
+1. For each ingredient, rate your confidence: "high", "medium", or "low"
 2. "high" = You have definitive knowledge from training data (well-known branded products, official formulations)
-3. "low" = You're guessing based on category or similar products
-4. Be honest - only mark "high" for ingredients you're certain about
+3. "medium" = You're reasonably confident based on typical formulations for this product type
+4. "low" = You're guessing with little certainty
+5. Be honest about your confidence level for each ingredient
 
 Return JSON format:
-{{"ingredients": [{{"name": "ingredient", "confidence": "high|low"}}]}}
+{{"ingredients": [{{"name": "ingredient", "confidence": "high|medium|low"}}]}}
 
 Examples:
 - Quaker Oats → {{"ingredients": [{{"name": "Whole Grain Rolled Oats", "confidence": "high"}}]}}
 - Nutella → {{"ingredients": [{{"name": "Sugar", "confidence": "high"}}, {{"name": "Palm Oil", "confidence": "high"}}, {{"name": "Hazelnuts", "confidence": "high"}}]}}
+- Generic chocolate bar → {{"ingredients": [{{"name": "Sugar", "confidence": "medium"}}, {{"name": "Cocoa", "confidence": "medium"}}, {{"name": "Milk", "confidence": "medium"}}]}}
 - Unknown local brand → {{"ingredients": [{{"name": "Sugar", "confidence": "low"}}, {{"name": "Flour", "confidence": "low"}}]}}"""
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a product ingredient expert. Be honest about confidence - only mark 'high' for ingredients you KNOW are in the product from your training data. Mark 'low' for anything you're guessing. Return valid JSON."},
+                {"role": "system", "content": "You are a product ingredient expert. Rate each ingredient's confidence honestly: 'high' for ingredients you KNOW are in the product, 'medium' for typical ingredients based on product type, 'low' for guesses. Return valid JSON."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.0,  # Zero temperature for consistent, factual responses
@@ -196,30 +198,33 @@ Examples:
             result = json.loads(content)
             ingredients_data = result.get("ingredients", [])
             
-            # Filter to ONLY high-confidence ingredients
-            high_confidence_ingredients = []
+            # Filter to high and medium confidence ingredients
+            accepted_ingredients = []
             low_confidence_count = 0
+            highest_confidence = "medium"  # Track the best confidence level found
             
             for item in ingredients_data:
                 if isinstance(item, dict):
                     name = item.get("name", "")
                     conf = item.get("confidence", "low")
-                    if conf == "high" and name:
-                        high_confidence_ingredients.append(name)
+                    if conf in ["high", "medium"] and name:
+                        accepted_ingredients.append(name)
+                        if conf == "high":
+                            highest_confidence = "high"
                     else:
                         low_confidence_count += 1
                 elif isinstance(item, str):
                     # Fallback if AI returns simple strings (treat as low confidence)
                     low_confidence_count += 1
             
-            if high_confidence_ingredients:
-                logger.info(f"[INGREDIENT INFERENCE] Found {len(high_confidence_ingredients)} HIGH confidence ingredients for {brand} {product_name} (filtered out {low_confidence_count} low confidence)")
+            if accepted_ingredients:
+                logger.info(f"[INGREDIENT INFERENCE] Found {len(accepted_ingredients)} HIGH/MEDIUM confidence ingredients for {brand} {product_name} (filtered out {low_confidence_count} low confidence)")
                 return {
-                    "likely_ingredients": high_confidence_ingredients,
-                    "confidence": "high"
+                    "likely_ingredients": accepted_ingredients,
+                    "confidence": highest_confidence
                 }
             else:
-                logger.info(f"[INGREDIENT INFERENCE] No HIGH confidence ingredients for {brand} {product_name} ({low_confidence_count} low confidence filtered out) - will try web search")
+                logger.info(f"[INGREDIENT INFERENCE] No HIGH/MEDIUM confidence ingredients for {brand} {product_name} ({low_confidence_count} low confidence filtered out) - will try web search")
                 return {
                     "likely_ingredients": [],
                     "confidence": "low"
