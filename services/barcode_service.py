@@ -2,6 +2,7 @@
 Barcode Product Lookup Service
 Queries Open Food Facts, Open Beauty Facts, and Open Product Facts APIs
 Includes web search fallback for products with empty ingredient data
+Includes vision fallback for products with "Unknown Product" name
 """
 
 import requests
@@ -16,6 +17,18 @@ from services.cache_service import cache_service
 from services.timing_logger import async_time_operation, log_timing_summary
 
 logger = logging.getLogger(__name__)
+
+
+async def download_image_from_url(url: str) -> Optional[bytes]:
+    """Download image from URL and return bytes"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    return await response.read()
+    except Exception as e:
+        logger.error(f"Failed to download image from {url}: {e}")
+    return None
 
 
 class BarcodeService:
@@ -262,6 +275,7 @@ class BarcodeService:
     async def _normalize_product_data(self, product: Dict[str, Any], source: str) -> Dict[str, Any]:
         """
         Normalize product data from different Open*Facts APIs into a consistent format
+        Includes vision fallback if product name is "Unknown Product"
         Includes web search fallback if ingredients are missing
         
         Args:
@@ -322,6 +336,50 @@ class BarcodeService:
                 product.get("ingredients_text", "") or 
                 product.get("ingredients_text_en", "")
             )
+        
+        # === VISION FALLBACK: If product name is "Unknown Product" and we have an image ===
+        product_name = normalized.get("name", "")
+        is_unknown = (
+            not product_name or 
+            product_name.lower() in ["unknown product", "unknown", ""] or
+            len(product_name) < 3
+        )
+        
+        if is_unknown and normalized.get("image_url"):
+            logger.info(f"Product name is '{product_name}' - attempting vision identification from image")
+            try:
+                # Import vision service here to avoid circular imports
+                from services.vision_service import get_vision_service
+                
+                # Download the image
+                image_bytes = await download_image_from_url(normalized["image_url"])
+                
+                if image_bytes:
+                    logger.info(f"Downloaded image ({len(image_bytes)} bytes), running vision identification...")
+                    vision_service = get_vision_service()
+                    vision_result = await vision_service.identify_product_from_photo(image_bytes)
+                    
+                    if vision_result and vision_result.get("product_name"):
+                        # Update normalized data with vision results
+                        logger.info(f"✅ Vision identified: {vision_result.get('brand', '')} {vision_result.get('product_name')}")
+                        normalized["name"] = vision_result.get("product_name", normalized["name"])
+                        normalized["brands"] = vision_result.get("brand", "") or normalized["brands"]
+                        normalized["categories"] = vision_result.get("category", "") or normalized["categories"]
+                        normalized["source"] = f"{source} + vision"
+                        
+                        # Store vision data for later use
+                        normalized["vision_data"] = {
+                            "product_type": vision_result.get("product_type", ""),
+                            "marketing_claims": vision_result.get("marketing_claims", []),
+                            "certifications_visible": vision_result.get("certifications_visible", []),
+                            "container_info": vision_result.get("container_info", {}),
+                        }
+                    else:
+                        logger.warning("Vision identification returned no product name")
+                else:
+                    logger.warning("Failed to download image for vision identification")
+            except Exception as e:
+                logger.error(f"Vision fallback failed: {e}")
         
         # === NEW: Web Search Fallback if ingredients empty ===
         data_source = "database"
