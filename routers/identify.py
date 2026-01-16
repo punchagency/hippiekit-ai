@@ -643,11 +643,10 @@ async def separate_photo_ingredients(
 ):
     """
     Step 2: Separate ingredients into harmful/safe
-    Uses smart strategy:
+    PRIORITIZES ACCURACY:
     - Check cache first (instant, consistent results)
-    - If brand is known: AI inference first (fast, accurate for known products)
-    - If brand is unknown/not visible: Web search first (AI can't know specific formulation)
-    - Fallback chain ensures we always try to get data
+    - Web search first (most accurate - real product data)
+    - AI inference as fallback only (when web search fails)
     
     Returns just the ingredient names, descriptions come later
     """
@@ -671,77 +670,56 @@ async def separate_photo_ingredients(
         # Check if we have a real brand name (not empty, "Not visible", "Unknown", etc.)
         brand_is_known = brand and brand.lower() not in ["", "not visible", "unknown", "none", "n/a"]
         
-        if brand_is_known:
-            # STRATEGY A: Brand is known → AI inference first (fast for known products)
-            logger.info(f"Brand '{brand}' is known - trying AI inference first")
-            inferred_result = await infer_ingredients_from_category(
+        # STRATEGY: WEB SEARCH FIRST for accuracy (real product data)
+        logger.info(f"Trying web search for accurate ingredient data...")
+        web_result = await web_search_service.search_product_ingredients(
+            product_name=product_name,
+            brand=brand if brand_is_known else "",  # Don't send "Not visible" as brand
+            category=category
+        )
+        
+        if web_result and web_result.get('ingredients'):
+            ingredients_text = web_result['ingredients']
+            data_source = web_result['source']
+            logger.info(f"✅ Found accurate ingredients via web search")
+        else:
+            # FALLBACK 1: Alternative web search with context
+            logger.info(f"Primary web search failed, trying context search")
+            search_result = await search_ingredients_from_context(
                 product_name=product_name,
-                brand=brand,
+                brand=brand if brand_is_known else "",
                 category=category or ''
             )
             
-            ai_ingredients = inferred_result.get('likely_ingredients', []) if inferred_result else []
-            
-            if ai_ingredients:
-                ingredients_text = ', '.join(ai_ingredients)
-                data_source = 'ai_inference (high confidence)'
-                logger.info(f"✅ AI inference succeeded with {len(ai_ingredients)} HIGH/MEDIUM confidence ingredients")
+            if search_result and search_result.get('likely_ingredients'):
+                ingredients_text = ', '.join(search_result['likely_ingredients'])
+                data_source = 'web_search_context'
+                logger.info(f"✅ Found {len(search_result['likely_ingredients'])} ingredients via context search")
             else:
-                logger.info(f"AI inference returned no confident ingredients, falling back to web search")
-        else:
-            # STRATEGY B: Brand unknown → Skip AI (it can only guess generic ingredients)
-            logger.info(f"Brand not visible/unknown - skipping AI inference, using web search directly")
-        
-        # If we don't have ingredients yet (AI failed or was skipped), try web search
-        if not ingredients_text:
-            logger.info(f"Trying web search for ingredients...")
-            web_result = await web_search_service.search_product_ingredients(
-                product_name=product_name,
-                brand=brand if brand_is_known else "",  # Don't send "Not visible" as brand
-                category=category
-            )
-            
-            if web_result and web_result.get('ingredients'):
-                ingredients_text = web_result['ingredients']
-                data_source = web_result['source']
-                logger.info(f"Found ingredients via web search")
-            else:
-                # FALLBACK: Alternative web search with context
-                logger.warning(f"Primary web search failed, trying context search")
-                search_result = await search_ingredients_from_context(
+                # FALLBACK 2: AI inference as last resort (only when web search fails)
+                logger.info(f"Web search failed, using AI inference as fallback (may be less accurate)")
+                inferred_result = await infer_ingredients_from_category(
                     product_name=product_name,
                     brand=brand if brand_is_known else "",
                     category=category or ''
                 )
                 
-                if search_result and search_result.get('likely_ingredients'):
-                    ingredients_text = ', '.join(search_result['likely_ingredients'])
-                    data_source = 'web_search_context'
-                    logger.info(f"Found {len(search_result['likely_ingredients'])} ingredients via context search")
+                ai_ingredients = inferred_result.get('likely_ingredients', []) if inferred_result else []
+                
+                if ai_ingredients:
+                    ingredients_text = ', '.join(ai_ingredients)
+                    ai_confidence = inferred_result.get('confidence', 'low')
+                    data_source = f'ai_inference ({ai_confidence} confidence - no web data found)'
+                    logger.info(f"⚠️ AI inference returned {len(ai_ingredients)} ingredients (confidence: {ai_confidence})")
                 else:
-                    # LAST RESORT: If brand unknown and web search failed, try AI anyway
-                    if not brand_is_known:
-                        logger.info(f"Web search failed for unknown brand, trying AI inference as last resort")
-                        inferred_result = await infer_ingredients_from_category(
-                            product_name=product_name,
-                            brand="",
-                            category=category or ''
-                        )
-                        ai_ingredients = inferred_result.get('likely_ingredients', []) if inferred_result else []
-                        if ai_ingredients:
-                            ingredients_text = ', '.join(ai_ingredients)
-                            data_source = 'ai_inference (generic product)'
-                            logger.info(f"AI inference returned {len(ai_ingredients)} ingredients as last resort")
-                    
                     # If still no ingredients, return empty
-                    if not ingredients_text:
-                        logger.warning(f"Could not find or infer ingredients for {brand} {product_name}")
-                        return {
-                            "harmful": [],
-                            "safe": [],
-                            "data_source": "none",
-                            "message": "Could not find ingredient information"
-                        }
+                    logger.warning(f"Could not find or infer ingredients for {brand} {product_name}")
+                    return {
+                        "harmful": [],
+                        "safe": [],
+                        "data_source": "none",
+                        "message": "Could not find ingredient information"
+                    }
         
         # Check for harmful chemicals
         chemical_flags = check_ingredients(ingredients_text)
@@ -830,8 +808,10 @@ async def separate_photo_packaging(
     category: str = Form("")
 ):
     """
-    Step 4: Get packaging material names (FAST - 1-2s)
-    Uses AI inference first (packaging is generic/inferable), web search as fallback
+    Step 4: Get packaging material names
+    PRIORITIZES ACCURACY:
+    - Web search first (most accurate - real product data)
+    - AI inference as fallback only (when web search fails)
     
     Returns just the material names, descriptions come later
     """
@@ -839,17 +819,44 @@ async def separate_photo_packaging(
     try:
         logger.info(f"Finding packaging for: {brand} {product_name}")
         
-        # PRIMARY: AI inference first (packaging is generic, inference is acceptable)
-        # Unlike ingredients, packaging types are common and predictable
-        logger.info(f"Inferring packaging from AI knowledge")
+        # Check if we have a real brand name
+        brand_is_known = brand and brand.lower() not in ["", "not visible", "unknown", "none", "n/a"]
+        
+        # STRATEGY: WEB SEARCH FIRST for accuracy (real product data)
+        logger.info(f"Trying web search for accurate packaging data...")
+        web_result = await web_search_service.search_product_packaging(
+            product_name=product_name,
+            brand=brand if brand_is_known else "",
+            category=category
+        )
+        
+        # Check if web search succeeded
+        if web_result and web_result.get('materials'):
+            packaging_text = web_result.get('packaging', '')
+            materials = web_result.get('materials', [])
+            
+            logger.info(f"✅ Found accurate packaging materials via web search: {materials}")
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"⏱️ /packaging/separate completed in {elapsed_time:.2f}s")
+            
+            return {
+                "materials": materials,
+                "packaging_text": packaging_text,
+                "sources": web_result.get('sources', []),
+                "confidence": web_result.get('confidence', 'high'),
+                "_elapsed_time": round(elapsed_time, 2)
+            }
+        
+        # FALLBACK: AI inference only if web search fails
+        logger.info(f"Web search failed, using AI inference as fallback (may be less accurate)")
         inferred_materials = await infer_packaging_from_category(
             product_name=product_name,
             category=category or 'General'
         )
         
         if inferred_materials and len(inferred_materials) > 0:
-            # AI inference succeeded - use these results (skip slow web search!)
-            logger.info(f"✅ AI inference succeeded: {len(inferred_materials)} packaging materials")
+            logger.info(f"⚠️ AI inference returned {len(inferred_materials)} packaging materials (no web data found)")
             materials = [mat.lower() for mat in inferred_materials]
             
             elapsed_time = time.time() - start_time
@@ -859,34 +866,8 @@ async def separate_photo_packaging(
                 "materials": materials,
                 "packaging_text": ", ".join(inferred_materials),
                 "sources": [],
-                "confidence": "medium",  # AI inference for packaging is reliable
-                "note": "Packaging inferred from product type",
-                "_elapsed_time": round(elapsed_time, 2)
-            }
-        
-        # FALLBACK: Web search only if AI inference completely fails
-        logger.info(f"AI inference returned empty, falling back to web search")
-        web_result = await web_search_service.search_product_packaging(
-            product_name=product_name,
-            brand=brand,
-            category=category
-        )
-        
-        # Check if web search succeeded
-        if web_result and web_result.get('materials'):
-            packaging_text = web_result.get('packaging', '')
-            materials = web_result.get('materials', [])
-            
-            logger.info(f"Found packaging materials via web search: {materials}")
-            
-            elapsed_time = time.time() - start_time
-            logger.info(f"⏱️ /packaging/separate completed in {elapsed_time:.2f}s")
-            
-            return {
-                "materials": materials,
-                "packaging_text": packaging_text,
-                "sources": web_result.get('sources', []),
-                "confidence": web_result.get('confidence', 'medium'),
+                "confidence": "medium",  # Lower confidence for inference
+                "note": "Packaging inferred from product type (no web data found)",
                 "_elapsed_time": round(elapsed_time, 2)
             }
         

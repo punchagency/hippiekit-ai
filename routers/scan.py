@@ -1180,7 +1180,7 @@ Every ingredient must appear in exactly ONE list (harmful OR safe, never both).
                 {"role": "system", "content": "You are an expert at parsing ingredient labels and identifying harmful chemicals. You understand ingredient aliases, chemical names, E-numbers, and can semantically match ingredients to a harmful chemicals database. You always return valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.2,  # Slightly higher for better semantic matching
+            temperature=0.1,  # Slightly higher for better semantic matching
             max_tokens=1500
         )
         
