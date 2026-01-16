@@ -1,5 +1,6 @@
 from pinecone import Pinecone, ServerlessSpec
 import numpy as np
+import time
 from typing import List, Dict, Any, Optional
 import os
 
@@ -106,6 +107,8 @@ class PineconeService:
         Returns:
             List of matching products with scores
         """
+        start_time = time.time()
+        
         # Convert to list if numpy array
         if isinstance(query_embedding, np.ndarray):
             query_embedding = query_embedding.tolist()
@@ -116,6 +119,9 @@ class PineconeService:
             top_k=top_k,
             include_metadata=True
         )
+        
+        duration_ms = (time.time() - start_time) * 1000
+        print(f"   ⏱️  [PINECONE] Vector query: {duration_ms:.0f}ms ({len(results.matches)} matches)")
         
         # Format results
         products = []

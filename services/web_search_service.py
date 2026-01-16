@@ -5,6 +5,7 @@ Uses OpenAI's native web search to find product ingredients
 
 import os
 import logging
+import time
 from typing import Optional, Dict, Any
 from urllib.parse import quote
 import httpx
@@ -58,6 +59,7 @@ class WebSearchService:
                 'note': str
             }
         """
+        start_time = time.time()
         logger.info(f"[OPENAI WEB SEARCH] Searching for ingredients: {brand} {product_name}")
         
         # Build search query - improved prompt for better web search results
@@ -145,8 +147,9 @@ Instructions:
                 "low"
             )
             
-            logger.info(f"[OPENAI WEB SEARCH] Successfully found ingredients")
-            logger.info(f"[OPENAI WEB SEARCH] Sources: {len(sources)}")
+            duration_ms = (time.time() - start_time) * 1000
+            logger.info(f"[OPENAI WEB SEARCH] ✅ Found ingredients in {duration_ms:.0f}ms")
+            print(f"   ⏱️  [WEB SEARCH] Ingredient search: {duration_ms:.0f}ms")
             
             return {
                 "ingredients": output_text,
@@ -188,7 +191,7 @@ Instructions:
             encoded_brand_name = quote(brand_name, safe='')
             search_url = f"https://api.brandfetch.io/v2/search/{encoded_brand_name}"
             
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=5.0) as client:  # 5s is best practice for simple lookups
                 # Search for brand (no API key needed for search)
                 search_response = await client.get(search_url)
                 
