@@ -143,8 +143,8 @@ async def infer_ingredients_from_category(
     category: str
 ) -> Dict[str, Any]:
     """
-    Infer the EXACT ingredients for this specific product using AI knowledge (NO web search).
-    Attempts to recall the actual formulation if the product is known.
+    Infer ingredients for a product using AI knowledge (NO web search).
+    Returns ONLY high-confidence ingredients to avoid hallucination.
     
     Args:
         product_name: Product name
@@ -152,39 +152,40 @@ async def infer_ingredients_from_category(
         category: Product category
         
     Returns:
-        Dictionary with AI-inferred ingredients
-        Format: {"likely_ingredients": ["ingredient1", "ingredient2", ...]}
+        Dictionary with AI-inferred ingredients (only high confidence ones)
+        Format: {"likely_ingredients": ["ingredient1", "ingredient2", ...], "confidence": "high"}
     """
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
-        prompt = f"""Do you have EXACT knowledge of the ingredient list for this specific product from your training data?
+        prompt = f"""What are the ingredients in this product? Rate confidence PER INGREDIENT.
 
 Product: {product_name}
 Brand: {brand}
 Category: {category}
 
-CRITICAL INSTRUCTIONS:
-- ONLY return ingredients if you have definitive knowledge of this EXACT product's formulation
-- If you are uncertain, guessing, or only know typical ingredients for this category: return an empty array
-- Do NOT infer or guess based on similar products or category standards
-- We have other systems that will handle products you don't know
+INSTRUCTIONS:
+1. For each ingredient, rate your confidence: "high" (you KNOW this is in the product) or "low" (guessing/inferring)
+2. "high" = You have definitive knowledge from training data (well-known branded products, official formulations)
+3. "low" = You're guessing based on category or similar products
+4. Be honest - only mark "high" for ingredients you're certain about
 
-Return format:
-{{"ingredients": ["ingredient1", "ingredient2", ...]}} if you KNOW this exact product
-{{"ingredients": []}} if you are uncertain or don't have exact knowledge
+Return JSON format:
+{{"ingredients": [{{"name": "ingredient", "confidence": "high|low"}}]}}
 
-Example of KNOWN product: Dove Original Beauty Bar → {{"ingredients": ["Sodium Lauroyl Isethionate", "Stearic Acid", "Sodium Tallowate", ...]}}
-Example of UNKNOWN product: Generic store brand dish soap → {{"ingredients": []}}"""
+Examples:
+- Quaker Oats → {{"ingredients": [{{"name": "Whole Grain Rolled Oats", "confidence": "high"}}]}}
+- Nutella → {{"ingredients": [{{"name": "Sugar", "confidence": "high"}}, {{"name": "Palm Oil", "confidence": "high"}}, {{"name": "Hazelnuts", "confidence": "high"}}]}}
+- Unknown local brand → {{"ingredients": [{{"name": "Sugar", "confidence": "low"}}, {{"name": "Flour", "confidence": "low"}}]}}"""
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a product database expert. Only return ingredient lists for products you definitively know. If uncertain about ANY product, return an empty array. DO NOT guess or infer. Return only valid JSON."},
+                {"role": "system", "content": "You are a product ingredient expert. Be honest about confidence - only mark 'high' for ingredients you KNOW are in the product from your training data. Mark 'low' for anything you're guessing. Return valid JSON."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.0,
-            max_tokens=300,
+            temperature=0.0,  # Zero temperature for consistent, factual responses
+            max_tokens=600,
             response_format={"type": "json_object"}
         )
         
@@ -193,32 +194,48 @@ Example of UNKNOWN product: Generic store brand dish soap → {{"ingredients": [
         # Parse JSON response
         try:
             result = json.loads(content)
-            # Handle if wrapped in object like {"ingredients": [...]}
-            if isinstance(result, dict):
-                ingredients = result.get("ingredients", list(result.values())[0] if result else [])
-            else:
-                ingredients = result
-                
-            if isinstance(ingredients, list) and ingredients:
-                logger.info(f"[INGREDIENT INFERENCE] Found exact ingredients for {brand} {product_name}: {len(ingredients)} items")
+            ingredients_data = result.get("ingredients", [])
+            
+            # Filter to ONLY high-confidence ingredients
+            high_confidence_ingredients = []
+            low_confidence_count = 0
+            
+            for item in ingredients_data:
+                if isinstance(item, dict):
+                    name = item.get("name", "")
+                    conf = item.get("confidence", "low")
+                    if conf == "high" and name:
+                        high_confidence_ingredients.append(name)
+                    else:
+                        low_confidence_count += 1
+                elif isinstance(item, str):
+                    # Fallback if AI returns simple strings (treat as low confidence)
+                    low_confidence_count += 1
+            
+            if high_confidence_ingredients:
+                logger.info(f"[INGREDIENT INFERENCE] Found {len(high_confidence_ingredients)} HIGH confidence ingredients for {brand} {product_name} (filtered out {low_confidence_count} low confidence)")
                 return {
-                    "likely_ingredients": ingredients
+                    "likely_ingredients": high_confidence_ingredients,
+                    "confidence": "high"
                 }
             else:
-                logger.info(f"[INGREDIENT INFERENCE] No exact knowledge of {brand} {product_name} - returning empty for fallback")
+                logger.info(f"[INGREDIENT INFERENCE] No HIGH confidence ingredients for {brand} {product_name} ({low_confidence_count} low confidence filtered out) - will try web search")
                 return {
-                    "likely_ingredients": []
+                    "likely_ingredients": [],
+                    "confidence": "low"
                 }
         except json.JSONDecodeError as e:
             logger.error(f"[INGREDIENT INFERENCE] Failed to parse JSON: {e}")
             return {
-                "likely_ingredients": []
+                "likely_ingredients": [],
+                "confidence": "low"
             }
         
     except Exception as e:
         logger.error(f"[INGREDIENT INFERENCE] Failed: {e}")
         return {
-            "likely_ingredients": []
+            "likely_ingredients": [],
+            "confidence": "low"
         }
 
 
@@ -983,7 +1000,34 @@ Now generate {count} alternatives for "{product_name}" (category: {category}):""
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
         
-        alternatives = json.loads(content)
+        # Try to parse JSON with error recovery
+        try:
+            alternatives = json.loads(content)
+        except json.JSONDecodeError as json_err:
+            logger.warning(f"[AI ALTERNATIVES] JSON parse failed, attempting repair: {json_err}")
+            
+            # Try common JSON repairs
+            repaired_content = content
+            
+            # Fix trailing commas before ] or }
+            import re
+            repaired_content = re.sub(r',\s*([}\]])', r'\1', repaired_content)
+            
+            # Fix missing commas between objects
+            repaired_content = re.sub(r'}\s*{', r'},{', repaired_content)
+            
+            # Try parsing repaired content
+            try:
+                alternatives = json.loads(repaired_content)
+                logger.info("[AI ALTERNATIVES] JSON repair successful")
+            except json.JSONDecodeError:
+                logger.error(f"[AI ALTERNATIVES] JSON repair failed, returning empty list. Raw content: {content[:500]}...")
+                return []
+        
+        # Validate alternatives is a list
+        if not isinstance(alternatives, list):
+            logger.error(f"[AI ALTERNATIVES] Expected list, got {type(alternatives)}, returning empty")
+            return []
         
         # Add type marker and fetch brand logos IN PARALLEL
         from services.web_search_service import web_search_service
