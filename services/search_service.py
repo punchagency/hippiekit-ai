@@ -87,9 +87,8 @@ class SearchService:
                 filter=pinecone_filter if pinecone_filter else None
             )
             
-            # For short queries, boost scores if query is substring of product name
+            # For substring matching - boost any query that appears in product name
             query_lower = query.lower()
-            is_short_query = len(query.strip()) <= 4
             
             # Process and enrich results
             products = []
@@ -98,9 +97,9 @@ class SearchService:
                 metadata = match.metadata
                 product_name = metadata.get("name", "").lower()
                 
-                # Boost score for substring matches (especially for short queries)
+                # Boost score for substring matches in product name
                 score = float(match.score)
-                if is_short_query and query_lower in product_name:
+                if query_lower in product_name:
                     # Boost the score significantly for substring matches
                     score = max(score, 0.7)
                 
