@@ -8,12 +8,15 @@ import os
 import time
 import uuid
 from datetime import datetime
+import logging
 
 # Load environment variables before importing routers so imports see keys
 load_dotenv()
 
+
 from routers import scan_router, index_router
 from routers.identify import router as identify_router
+from routers.search import router as search_router
 from services.cache_service import cache_service
 from models.clip_embedder import get_clip_embedder
 
@@ -133,6 +136,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)  # Compress responses > 1K
 app.include_router(scan_router, tags=["scan"])
 app.include_router(index_router, tags=["index"])
 app.include_router(identify_router, tags=["product-identification"])
+app.include_router(search_router, tags=["search"])
 
 @app.get("/")
 async def root():
