@@ -123,6 +123,7 @@ class TextEmbedder:
         """
         Create a searchable text representation of a product.
         Combines name, description, and categories for better semantic matching.
+        Repeats product name multiple times to increase its weight in embeddings.
         
         Args:
             product: Product dictionary with name, description, categories
@@ -132,9 +133,12 @@ class TextEmbedder:
         """
         parts = []
         
-        # Product name (most important)
+        # Product name (most important) - repeat 3x for better matching
         if product.get('name'):
-            parts.append(product['name'])
+            name = product['name']
+            parts.append(name)
+            parts.append(name)  # Repeat for emphasis
+            parts.append(name)  # Repeat again
         
         # Categories (important for context)
         categories = product.get('categories', [])
@@ -143,11 +147,11 @@ class TextEmbedder:
             if category_names:
                 parts.append("Categories: " + ", ".join(category_names))
         
-        # Description (provides context)
+        # Description (provides context) - shortened to 200 chars
         description = product.get('description') or product.get('short_description', '')
         if description:
-            # Limit description length to avoid token limits
-            description_clean = description[:500]
+            # Limit description length to avoid token limits and reduce noise
+            description_clean = description[:200]
             parts.append(description_clean)
         
         # SKU for exact matching
