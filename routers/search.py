@@ -17,6 +17,15 @@ router = APIRouter(prefix="/api/search", tags=["search"])
 
 
 # Request/Response Models
+class CategoryMatch(BaseModel):
+    """Matched category model"""
+    id: int
+    name: str
+    slug: str
+    image: Optional[str] = None
+    product_count: int
+
+
 class SearchRequest(BaseModel):
     """Search request model"""
     query: str = Field(..., min_length=1, description="Search query text")
@@ -30,6 +39,7 @@ class SearchResponse(BaseModel):
     """Search response model"""
     query: str
     results: List[dict]
+    matching_categories: List[CategoryMatch]
     count: int
     limit: int
     min_score: float
