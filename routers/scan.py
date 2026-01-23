@@ -198,33 +198,34 @@ Examples:
             result = json.loads(content)
             ingredients_data = result.get("ingredients", [])
             
-            # Filter to high and medium confidence ingredients
+            # Include ALL ingredients regardless of confidence level (client wants to see everything)
             accepted_ingredients = []
-            low_confidence_count = 0
             highest_confidence = "medium"  # Track the best confidence level found
             
             for item in ingredients_data:
                 if isinstance(item, dict):
                     name = item.get("name", "")
                     conf = item.get("confidence", "low")
-                    if conf in ["high", "medium"] and name:
+                    if name:  # Accept ALL ingredients with a name
                         accepted_ingredients.append(name)
                         if conf == "high":
                             highest_confidence = "high"
-                    else:
-                        low_confidence_count += 1
+                        elif conf == "medium" and highest_confidence != "high":
+                            highest_confidence = "medium"
+                        elif conf == "low" and highest_confidence == "low":
+                            highest_confidence = "low"
                 elif isinstance(item, str):
-                    # Fallback if AI returns simple strings (treat as low confidence)
-                    low_confidence_count += 1
+                    # Fallback if AI returns simple strings
+                    accepted_ingredients.append(item)
             
             if accepted_ingredients:
-                logger.info(f"[INGREDIENT INFERENCE] Found {len(accepted_ingredients)} HIGH/MEDIUM confidence ingredients for {brand} {product_name} (filtered out {low_confidence_count} low confidence)")
+                logger.info(f"[INGREDIENT INFERENCE] Found {len(accepted_ingredients)} ingredients for {brand} {product_name} (including all confidence levels)")
                 return {
                     "likely_ingredients": accepted_ingredients,
                     "confidence": highest_confidence
                 }
             else:
-                logger.info(f"[INGREDIENT INFERENCE] No HIGH/MEDIUM confidence ingredients for {brand} {product_name} ({low_confidence_count} low confidence filtered out) - will try web search")
+                logger.info(f"[INGREDIENT INFERENCE] No ingredients inferred for {brand} {product_name} - will try web search")
                 return {
                     "likely_ingredients": [],
                     "confidence": "low"
@@ -1114,7 +1115,7 @@ TASKS:
    - cocoa butter
    - soy lecithin
 
-2. CATEGORIZE each ingredient as HARMFUL or SAFE based on health and environmental impact.
+2. CATEGORIZE each ingredient as HARMFUL, QUESTIONABLE, or SAFE based on health, environmental impact, and natural vs synthetic origin.
 
 === HARMFUL CHEMICALS DATABASE (MUST FLAG) ===
 The following comprehensive database contains chemicals that MUST be flagged as harmful.
@@ -1142,13 +1143,24 @@ ALWAYS FLAG AS HARMFUL:
 ✗ Heavily processed ingredients (protein isolates, concentrates, etc.)
 ✗ Ingredients with known health risks (endocrine disruptors, carcinogens, allergens)
 
+MARK AS QUESTIONABLE (approved but not ideal for natural/plant-based health):
+⚠ Synthetic mineral additives (calcium chloride, magnesium chloride, potassium bicarbonate, etc.)
+⚠ Synthetic vitamins and minerals (sodium selenate, ferric orthophosphate, cyanocobalamin, etc.)
+⚠ Industrial-grade salts and buffers (dipotassium phosphate, trisodium citrate, etc.)
+⚠ Synthetic pH adjusters (citric acid when synthetic, malic acid when synthetic, etc.)
+⚠ Processed/synthetic emulsifiers (soy lecithin when highly processed, mono/diglycerides, etc.)
+⚠ Refined mineral extracts (magnesium sulfate, calcium carbonate when synthetic, etc.)
+⚠ Lab-synthesized nutrients (ascorbic acid when synthetic vs natural vitamin C, etc.)
+⚠ Chemically modified ingredients that are FDA-approved but not naturally-derived
+⚠ Ultra-processed but "Generally Recognized as Safe" (GRAS) additives
+
 MARK AS SAFE:
-✓ Water, sea salt, Himalayan salt
+✓ Water, sea salt, Himalayan salt, natural mineral salts
 ✓ Whole food ingredients (even if not organic): cocoa, milk, butter, eggs, flour, oats, rice, fruits, vegetables
 ✓ Natural oils: olive oil, coconut oil, avocado oil, butter, ghee
 ✓ Natural sweeteners: honey, maple syrup, stevia, monk fruit, coconut sugar (even if not organic)
 ✓ Basic ingredients: baking soda, baking powder, vanilla extract, cocoa powder, chocolate
-✓ Vitamins and minerals (Vitamin C, Vitamin E, Calcium, Iron, etc.)
+✓ Naturally-derived vitamins and minerals from whole food sources
 ✓ Natural extracts and spices (unless flagged in database)
 ✓ Eggs, milk, dairy (even if not organic)
 ✓ Grains and legumes (wheat, soy, corn as ingredients - not as oils)
@@ -1160,28 +1172,31 @@ CRITICAL RULES:
 • "Natural flavor" ALWAYS harmful (hides chemicals)
 • "Fragrance" ALWAYS harmful (undisclosed mix)
 • Sugar IS harmful (flag it)
-• Non-organic ingredients are OK unless they're processed/synthetic
+• Synthetic additives that are "approved" but not natural = QUESTIONABLE
+• Smart Water example: calcium chloride, magnesium chloride, potassium bicarbonate = QUESTIONABLE
 • When in doubt about matching database: compare category and function
+• Questionable = approved for use but not ideal for daily consumption if aiming for natural, plant-based hydration
 
 OUTPUT FORMAT:
 Return ONLY valid JSON with NO explanations:
 {{
     "harmful": ["ingredient1", "ingredient2"],
-    "safe": ["ingredient3", "ingredient4"]
+    "questionable": ["ingredient3", "ingredient4"],
+    "safe": ["ingredient5", "ingredient6"]
 }}
 
 Each ingredient name should NOT include parentheses or descriptions.
-Every ingredient must appear in exactly ONE list (harmful OR safe, never both).
+Every ingredient must appear in exactly ONE list (harmful, questionable, OR safe - never in multiple).
 """
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",  # Faster and cheaper for this task
             messages=[
-                {"role": "system", "content": "You are an expert at parsing ingredient labels and identifying harmful chemicals. You understand ingredient aliases, chemical names, E-numbers, and can semantically match ingredients to a harmful chemicals database. You always return valid JSON only."},
+                {"role": "system", "content": "You are an expert at parsing ingredient labels and identifying harmful chemicals. You understand ingredient aliases, chemical names, E-numbers, and can semantically match ingredients to a harmful chemicals database. You categorize ingredients into harmful (toxic/dangerous), questionable (synthetic but approved), and safe (natural/whole food). You always return valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,  # Slightly higher for better semantic matching
-            max_tokens=1500
+            max_tokens=2000
         )
         
         content = response.choices[0].message.content.strip()
@@ -1193,42 +1208,45 @@ Every ingredient must appear in exactly ONE list (harmful OR safe, never both).
         
         result = json.loads(content)
         
-        logger.info(f"AI parsed and separated ingredients: {len(result.get('harmful', []))} harmful, {len(result.get('safe', []))} safe")
+        logger.info(f"AI parsed and separated ingredients: {len(result.get('harmful', []))} harmful, {len(result.get('questionable', []))} questionable, {len(result.get('safe', []))} safe")
         
         return result
         
     except Exception as e:
         logger.error(f"AI ingredient parsing/separation failed: {e}")
-        return {"harmful": [], "safe": []}
+        return {"harmful": [], "questionable": [], "safe": []}
         # Fallback to empty lists
-        return {"harmful": [], "safe": []}
+        return {"harmful": [], "questionable": [], "safe": []}
 
 
 def get_detailed_ingredient_descriptions(
     safe_ingredients: list, 
     harmful_ingredients: list,
+    questionable_ingredients: list,
     harmful_chemicals_db: list
 ) -> dict:
     """
     Generate detailed, user-friendly AI descriptions for ALREADY SEPARATED ingredients.
     
-    OPTIMIZED: Uses a SINGLE batched OpenAI API call for both harmful and safe ingredients.
+    OPTIMIZED: Uses a SINGLE batched OpenAI API call for harmful, questionable, and safe ingredients.
     
     Args:
         safe_ingredients: List of safe ingredient names (from AI separation)
         harmful_ingredients: List of harmful ingredient names (from AI separation)
+        questionable_ingredients: List of questionable ingredient names (from AI separation)
         harmful_chemicals_db: Database of harmful chemicals (for context in descriptions)
     
     Returns:
         {
             "safe": {"ingredient_name": "detailed description"},
-            "harmful": {"chemical_name": "detailed harmful description"}
+            "harmful": {"chemical_name": "detailed harmful description"},
+            "questionable": {"ingredient_name": "questionable description"}
         }
     """
     try:
         # If no ingredients to describe, return early
-        if not harmful_ingredients and not safe_ingredients:
-            return {"safe": {}, "harmful": {}}
+        if not harmful_ingredients and not safe_ingredients and not questionable_ingredients:
+            return {"safe": {}, "harmful": {}, "questionable": {}}
         
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
@@ -1248,27 +1266,35 @@ def get_detailed_ingredient_descriptions(
         
         harmful_str = ", ".join(harmful_items) if harmful_items else "None"
         safe_str = ", ".join(safe_ingredients[:20]) if safe_ingredients else "None"
+        questionable_str = ", ".join(questionable_ingredients[:20]) if questionable_ingredients else "None"
         
-        logger.info(f"[BATCHED] Generating descriptions for {len(harmful_ingredients)} harmful + {len(safe_ingredients)} safe ingredients in ONE API call")
+        logger.info(f"[BATCHED] Generating descriptions for {len(harmful_ingredients)} harmful + {len(questionable_ingredients)} questionable + {len(safe_ingredients)} safe ingredients in ONE API call")
         
-        # SINGLE BATCHED PROMPT for both harmful and safe
-        batched_prompt = f"""Analyze these ingredients from a consumer product. Provide descriptions for BOTH harmful AND safe ingredients in a single response.
+        # SINGLE BATCHED PROMPT for harmful, questionable, and safe
+        batched_prompt = f"""Analyze these ingredients from a consumer product. Provide descriptions for harmful, questionable, AND safe ingredients in a single response.
 
 === HARMFUL INGREDIENTS (be critical, explain dangers) ===
 {harmful_str}
+
+=== QUESTIONABLE INGREDIENTS (synthetic but approved - explain concerns) ===
+{questionable_str}
 
 === SAFE INGREDIENTS (be educational, honest about processing) ===
 {safe_str}
 
 INSTRUCTIONS:
 1. For HARMFUL ingredients: Explain what it is, why it's harmful, health/environmental risks. Be uncompromising.
-2. For SAFE ingredients: Brief 1-2 sentence educational description. Natural = positive, processed = honest critique.
-3. Use exact ingredient names as JSON keys.
+2. For QUESTIONABLE ingredients: Explain what it is, note it's approved for use BUT not ideal for daily consumption if aiming for natural, plant-based nutrition. Mention synthetic/industrial origin. Be honest but not alarmist.
+3. For SAFE ingredients: Brief 1-2 sentence educational description. Natural = positive, processed = honest critique.
+4. Use exact ingredient names as JSON keys.
 
 Return ONLY this JSON structure:
 {{
     "harmful": {{
         "Ingredient Name": "Critical description of why this is harmful..."
+    }},
+    "questionable": {{
+        "Ingredient Name": "Approved for use but not ideal for daily consumption if aiming for natural, plant-based nutrition. This is a synthetic..."
     }},
     "safe": {{
         "Ingredient Name": "Brief educational description..."
@@ -1288,6 +1314,12 @@ For HARMFUL ingredients:
 • Never say "safe in small amounts" or cite regulatory approval
 • E-numbers, dyes, artificial flavors = always problematic
 
+For QUESTIONABLE ingredients:
+• Acknowledge FDA/regulatory approval BUT emphasize not ideal for natural/plant-based health
+• Highlight synthetic/industrial origin (e.g., "industrial-grade salt additive")
+• Message: "approved for use but not ideal for daily consumption if aiming for natural, plant-based nutrition"
+• Balance - not alarmist but honest about synthetic nature
+
 For SAFE ingredients:
 • Natural = positive descriptions
 • Ultra-processed = honest critique
@@ -1298,7 +1330,7 @@ Output ONLY valid JSON with the exact structure requested."""
                 {"role": "user", "content": batched_prompt}
             ],
             temperature=0.3,
-            max_tokens=3000
+            max_tokens=4000
         )
         
         content = response.choices[0].message.content.strip()
@@ -1312,21 +1344,24 @@ Output ONLY valid JSON with the exact structure requested."""
         result = json.loads(content)
         
         harmful_descriptions = result.get("harmful", {})
+        questionable_descriptions = result.get("questionable", {})
         safe_descriptions = result.get("safe", {})
         
-        logger.info(f"[BATCHED] Generated {len(harmful_descriptions)} harmful + {len(safe_descriptions)} safe descriptions in ONE call")
+        logger.info(f"[BATCHED] Generated {len(harmful_descriptions)} harmful + {len(questionable_descriptions)} questionable + {len(safe_descriptions)} safe descriptions in ONE call")
         
         return {
             "safe": safe_descriptions,
-            "harmful": harmful_descriptions
+            "harmful": harmful_descriptions,
+            "questionable": questionable_descriptions
         }
         
     except Exception as e:
         logger.error(f"Error in get_detailed_ingredient_descriptions (batched): {e}", exc_info=True)
         # Fallback to basic descriptions
         harmful_descriptions = {ing: "This ingredient has been flagged as potentially harmful." for ing in harmful_ingredients}
+        questionable_descriptions = {ing: "Approved for use but not ideal for daily consumption if aiming for natural, plant-based nutrition." for ing in questionable_ingredients}
         safe_descriptions = {ing: "Common ingredient used in consumer products." for ing in safe_ingredients}
-        return {"safe": safe_descriptions, "harmful": harmful_descriptions}
+        return {"safe": safe_descriptions, "harmful": harmful_descriptions, "questionable": questionable_descriptions}
 
 
 # === ASYNC PARALLEL VERSIONS FOR OPTIMIZED PERFORMANCE ===
@@ -2252,6 +2287,7 @@ class IngredientsDescribeRequest(BaseModel):
     """Request model for ingredient descriptions"""
     barcode: str
     harmful_ingredients: list[str]
+    questionable_ingredients: list[str]
     safe_ingredients: list[str]
 
 
@@ -2343,6 +2379,7 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
                 'success': True,
                 'has_ingredients': False,
                 'harmful': [],
+                'questionable': [],
                 'safe': [],
                 'message': 'No ingredients found'
             }
@@ -2352,18 +2389,21 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
         separated = await separate_ingredients_with_ai(ingredients_text, [])
         
         harmful_ingredient_names = separated.get("harmful", [])
+        questionable_ingredient_names = separated.get("questionable", [])
         safe_ingredient_names = separated.get("safe", [])
         
-        logger.info(f"[INGREDIENTS-SEPARATE] Complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+        logger.info(f"[INGREDIENTS-SEPARATE] Complete: {len(harmful_ingredient_names)} harmful, {len(questionable_ingredient_names)} questionable, {len(safe_ingredient_names)} safe")
         
-        total_ingredients = len(harmful_ingredient_names) + len(safe_ingredient_names)
+        total_ingredients = len(harmful_ingredient_names) + len(questionable_ingredient_names) + len(safe_ingredient_names)
         
         return {
             'success': True,
             'has_ingredients': True,
             'harmful': harmful_ingredient_names,
+            'questionable': questionable_ingredient_names,
             'safe': safe_ingredient_names,
             'harmful_count': len(harmful_ingredient_names),
+            'questionable_count': len(questionable_ingredient_names),
             'safe_count': len(safe_ingredient_names),
             'total_count': total_ingredients,
             'message': f'Parsed and separated {total_ingredients} ingredients'
@@ -2394,7 +2434,7 @@ async def describe_ingredients(request: IngredientsDescribeRequest) -> Dict[str,
         if not barcode or not barcode.isdigit():
             raise HTTPException(status_code=400, detail="Invalid barcode")
         
-        logger.info(f"[INGREDIENTS-DESCRIBE] Generating descriptions for {len(request.harmful_ingredients)} harmful, {len(request.safe_ingredients)} safe ingredients")
+        logger.info(f"[INGREDIENTS-DESCRIBE] Generating descriptions for {len(request.harmful_ingredients)} harmful, {len(request.questionable_ingredients)} questionable, {len(request.safe_ingredients)} safe ingredients")
         
         # Generate harmful chemicals list
         harmful_chemicals = [
@@ -2402,10 +2442,11 @@ async def describe_ingredients(request: IngredientsDescribeRequest) -> Dict[str,
             for name in request.harmful_ingredients
         ]
         
-        # GENERATE DESCRIPTIONS (SLOW - 2 AI calls)
+        # GENERATE DESCRIPTIONS (SLOW - 1 batched AI call)
         ingredient_descriptions = get_detailed_ingredient_descriptions(
             safe_ingredients=request.safe_ingredients,
             harmful_ingredients=request.harmful_ingredients,
+            questionable_ingredients=request.questionable_ingredients,
             harmful_chemicals_db=harmful_chemicals
         )
         

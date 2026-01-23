@@ -716,6 +716,7 @@ async def separate_photo_ingredients(
                     logger.warning(f"Could not find or infer ingredients for {brand} {product_name}")
                     return {
                         "harmful": [],
+                        "questionable": [],
                         "safe": [],
                         "data_source": "none",
                         "message": "Could not find ingredient information"
@@ -728,12 +729,13 @@ async def separate_photo_ingredients(
         separated = await separate_ingredients_with_ai(ingredients_text, chemical_flags)
         
         elapsed_time = time.time() - start_time
-        logger.info(f"Separated: {len(separated.get('harmful', []))} harmful, {len(separated.get('safe', []))} safe")
+        logger.info(f"Separated: {len(separated.get('harmful', []))} harmful, {len(separated.get('questionable', []))} questionable, {len(separated.get('safe', []))} safe")
         logger.info(f"⏱️ /ingredients/separate completed in {elapsed_time:.2f}s")
         
         # Build result
         result = {
             "harmful": separated.get("harmful", []),
+            "questionable": separated.get("questionable", []),
             "safe": separated.get("safe", []),
             "data_source": data_source,
             "ingredients_text": ingredients_text,  # Return for future calls
@@ -754,6 +756,7 @@ async def separate_photo_ingredients(
 @router.post("/ingredients/describe")
 async def describe_photo_ingredients(
     harmful_ingredients: str = Form(""),  # Comma-separated list (optional)
+    questionable_ingredients: str = Form(""),  # Comma-separated list (optional)
     safe_ingredients: str = Form("")  # Comma-separated list (optional)
 ):
     """
@@ -766,24 +769,27 @@ async def describe_photo_ingredients(
     try:
         # Parse comma-separated lists
         harmful_list = [ing.strip() for ing in harmful_ingredients.split(',') if ing.strip()]
+        questionable_list = [ing.strip() for ing in questionable_ingredients.split(',') if ing.strip()]
         safe_list = [ing.strip() for ing in safe_ingredients.split(',') if ing.strip()]
         
         # If no ingredients provided, return empty descriptions
-        if not harmful_list and not safe_list:
+        if not harmful_list and not safe_list and not questionable_list:
             logger.warning("No ingredients provided for description")
             return {
                 "descriptions": {
                     "harmful": {},
+                    "questionable": {},
                     "safe": {}
                 }
             }
         
-        logger.info(f"Generating descriptions for {len(harmful_list)} harmful + {len(safe_list)} safe ingredients")
+        logger.info(f"Generating descriptions for {len(harmful_list)} harmful + {len(questionable_list)} questionable + {len(safe_list)} safe ingredients")
         
         # Generate descriptions
         descriptions = get_detailed_ingredient_descriptions(
             safe_ingredients=safe_list,
             harmful_ingredients=harmful_list,
+            questionable_ingredients=questionable_list,
             harmful_chemicals_db=[]  # Descriptions don't need chemical flags
         )
         

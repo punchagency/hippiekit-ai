@@ -329,13 +329,15 @@ def check_ingredients(ingredient_text: str) -> List[Dict[str, Any]]:
     return result
 
 
-def calculate_safety_score(flagged_chemicals: List[Dict[str, Any]]) -> int:
+def calculate_safety_score(flagged_chemicals: List[Dict[str, Any]], questionable_count: int = 0) -> int:
     """
-    Calculate safety score (0-100) based on flagged chemicals.
+    Calculate safety score (0-100) based on flagged chemicals and questionable ingredients.
     Base score 100, subtract: -20 per critical, -10 per high, -5 per moderate, -2 per low.
+    Questionable ingredients: -3 per ingredient (moderate impact between low and moderate)
     
     Args:
         flagged_chemicals: List of dicts from check_ingredients()
+        questionable_count: Number of questionable (synthetic but approved) ingredients
     
     Returns:
         Safety score (0-100)
@@ -353,6 +355,9 @@ def calculate_safety_score(flagged_chemicals: List[Dict[str, Any]]) -> int:
             score -= 5
         elif severity == LOW:
             score -= 2
+    
+    # Subtract for questionable ingredients (moderate impact)
+    score -= (questionable_count * 3)
     
     # Clamp to 0-100
     return max(0, min(100, score))
