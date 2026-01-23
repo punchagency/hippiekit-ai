@@ -10,10 +10,11 @@ from pathlib import Path
 
 
 # Severity levels
-CRITICAL = "critical"  # -20 points
-HIGH = "high"          # -10 points
-MODERATE = "moderate"  # -5 points
-LOW = "low"            # -2 points
+CRITICAL = "critical"      # -20 points
+HIGH = "high"              # -10 points
+MODERATE = "moderate"      # -5 points
+QUESTIONABLE = "questionable"  # -3 points (not harmful, but not "clean" - synthetic additives)
+LOW = "low"                # -2 points
 
 
 # Chemical Database with Categories, Aliases, and Severity
@@ -236,6 +237,19 @@ CHEMICALS = {
     "Sodium Nitrite": {"category": "Processing Aids", "severity": HIGH, "aliases": []},
     "Sodium Nitrate": {"category": "Processing Aids", "severity": HIGH, "aliases": []},
     "Benzoyl Peroxide": {"category": "Processing Aids", "severity": MODERATE, "aliases": []},
+    
+    # ========== SYNTHETIC MINERALS & ADDITIVES (QUESTIONABLE) ==========
+    # These are FDA-approved but not naturally sourced - commonly found in processed waters
+    "Calcium Chloride": {"category": "Synthetic Minerals", "severity": QUESTIONABLE, "aliases": ["cacl2", "e509"]},
+    "Magnesium Chloride": {"category": "Synthetic Minerals", "severity": QUESTIONABLE, "aliases": ["mgcl2", "e511"]},
+    "Potassium Bicarbonate": {"category": "Synthetic Minerals", "severity": QUESTIONABLE, "aliases": ["khco3", "e501"]},
+    "Sodium Selenate": {"category": "Synthetic Minerals", "severity": QUESTIONABLE, "aliases": ["na2seo4"]},
+    "Sodium Bicarbonate": {"category": "Synthetic Minerals", "severity": QUESTIONABLE, "aliases": ["baking soda", "e500"]},
+    "Potassium Chloride": {"category": "Synthetic Minerals", "severity": QUESTIONABLE, "aliases": ["kcl", "e508"]},
+    "Magnesium Sulfate": {"category": "Synthetic Minerals", "severity": QUESTIONABLE, "aliases": ["epsom salt", "mgso4", "e518"]},
+    "Calcium Sulfate": {"category": "Synthetic Minerals", "severity": QUESTIONABLE, "aliases": ["gypsum", "caso4", "e516"]},
+    "Sodium Phosphate": {"category": "Synthetic Minerals", "severity": QUESTIONABLE, "aliases": ["trisodium phosphate", "e339"]},
+    "Potassium Phosphate": {"category": "Synthetic Minerals", "severity": QUESTIONABLE, "aliases": ["e340"]},
 }
 
 
@@ -320,10 +334,10 @@ def check_ingredients(ingredient_text: str) -> List[Dict[str, Any]]:
                 }
     
     # Convert to list and sort by severity
-    severity_order = {CRITICAL: 0, HIGH: 1, MODERATE: 2, LOW: 3}
+    severity_order = {CRITICAL: 0, HIGH: 1, MODERATE: 2, QUESTIONABLE: 3, LOW: 4}
     result = sorted(
         found.values(),
-        key=lambda x: (severity_order[x["severity"]], x["chemical"])
+        key=lambda x: (severity_order.get(x["severity"], 5), x["chemical"])
     )
     
     return result
@@ -332,7 +346,7 @@ def check_ingredients(ingredient_text: str) -> List[Dict[str, Any]]:
 def calculate_safety_score(flagged_chemicals: List[Dict[str, Any]]) -> int:
     """
     Calculate safety score (0-100) based on flagged chemicals.
-    Base score 100, subtract: -20 per critical, -10 per high, -5 per moderate, -2 per low.
+    Base score 100, subtract: -20 per critical, -10 per high, -5 per moderate, -3 per questionable, -2 per low.
     
     Args:
         flagged_chemicals: List of dicts from check_ingredients()
@@ -351,6 +365,8 @@ def calculate_safety_score(flagged_chemicals: List[Dict[str, Any]]) -> int:
             score -= 10
         elif severity == MODERATE:
             score -= 5
+        elif severity == QUESTIONABLE:
+            score -= 3
         elif severity == LOW:
             score -= 2
     
@@ -424,6 +440,11 @@ def generate_recommendations(
         avoid.add("Products without third-party testing for heavy metals")
         look_for.add("Brands that publish heavy metal test results")
     
+    if "Synthetic Minerals" in categories_found:
+        avoid.add("Products with synthetic mineral additives used for pH buffering or fortification")
+        look_for.add("Naturally mineralized spring water or filtered water")
+        look_for.add("Products with minerals from natural sources")
+    
     # General certifications
     if len(flagged_chemicals) >= 3:
         certifications.add("EWG Verified")
@@ -459,12 +480,19 @@ def get_condensed_chemical_list() -> str:
     """
     # Group by category
     by_category = {}
+    questionable_category = {}
+    
     for chem_name, chem_data in CHEMICALS.items():
         category = chem_data["category"]
         severity = chem_data["severity"]
         
-        # Only include critical and high severity for condensed list
-        if severity in [CRITICAL, HIGH]:
+        # Separate questionable into its own group
+        if severity == QUESTIONABLE:
+            if category not in questionable_category:
+                questionable_category[category] = []
+            questionable_category[category].append(chem_name)
+        # Only include critical and high severity for harmful condensed list
+        elif severity in [CRITICAL, HIGH]:
             if category not in by_category:
                 by_category[category] = []
             by_category[category].append(chem_name)
@@ -473,6 +501,12 @@ def get_condensed_chemical_list() -> str:
     lines = ["CHEMICAL RED FLAGS (flag if found):"]
     for category, chemicals in sorted(by_category.items()):
         lines.append(f"\n{category}: {', '.join(sorted(chemicals))}")
+    
+    # Add questionable chemicals section
+    if questionable_category:
+        lines.append("\n\nQUESTIONABLE ADDITIVES (approved but not natural):")
+        for category, chemicals in sorted(questionable_category.items()):
+            lines.append(f"\n{category}: {', '.join(sorted(chemicals))}")
     
     return "\n".join(lines)
 

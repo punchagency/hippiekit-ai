@@ -448,6 +448,7 @@ class BarcodeService:
             "Pesticides": "Toxic agricultural chemical with potential carcinogenic effects",
             "Heavy Metals": "Toxic metal that accumulates in body and causes organ damage",
             "Sunscreen": "Chemical UV filter that may disrupt hormones and harm coral reefs",
+            "Synthetic Minerals": "Synthetic mineral additive commonly used in industrial applications. Approved for use but not naturally sourced.",
         }
         return explanations.get(category, f"{category} chemical with potential health concerns")
     

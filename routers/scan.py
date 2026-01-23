@@ -28,6 +28,7 @@ class BarcodeLookupRequest(BaseModel):
     """Request model for barcode lookup"""
     barcode: str
     product_data: Optional[Dict[str, Any]] = None  # Optional pre-fetched product data to avoid redundant API calls
+    is_clean_scan: Optional[bool] = None  # Whether the scanned product has no harmful ingredients (for clean product recommendations)
 
 
 def normalize_ingredient_text(text: str) -> str:
@@ -611,7 +612,8 @@ async def get_product_recommendations_with_image(
 async def get_product_recommendations_for_barcode(
     product_data: Dict[str, Any],
     top_k: int = 10,  # Query more to allow filtering
-    min_score: float = 0.3  # Lower threshold, we'll filter with AI
+    min_score: float = 0.3,  # Lower threshold, we'll filter with AI
+    is_clean_scan: bool = None  # Whether the scanned product has no harmful ingredients
 ) -> Dict[str, Any]:
     """
     Get product recommendations for a barcode-scanned product using multimodal search + AI filtering.
@@ -622,11 +624,13 @@ async def get_product_recommendations_for_barcode(
     3. Query Pinecone for similar products
     4. Use AI to filter out irrelevant matches (e.g., don't recommend mattresses for candy)
     5. If no relevant matches: generate AI alternatives
+    6. For CLEAN SCANS: Prioritize same-category products (e.g., olive oil -> other olive oils)
     
     Args:
         product_data: Barcode product data with name, categories, image_url, etc.
         top_k: Number of candidates to retrieve (default: 10, will be filtered)
         min_score: Minimum similarity score threshold (default: 0.3)
+        is_clean_scan: Whether the scanned product has no harmful ingredients
         
     Returns:
         {
@@ -700,13 +704,14 @@ async def get_product_recommendations_for_barcode(
             ai_alternatives = await generate_ai_product_alternatives(
                 product_name=product_name,
                 category=primary_category,
-                count=3
+                count=3,
+                is_clean_scan=is_clean_scan
             )
             return {
                 "status": "ai_fallback",
                 "products": [],
                 "ai_alternatives": ai_alternatives,
-                "message": "No embeddings available. Showing AI-recommended alternatives.",
+                "message": "Showing recommended alternatives." if is_clean_scan else "No embeddings available. Showing AI-recommended alternatives.",
                 "embedding_method": "none"
             }
         
@@ -726,13 +731,14 @@ async def get_product_recommendations_for_barcode(
             ai_alternatives = await generate_ai_product_alternatives(
                 product_name=product_name,
                 category=primary_category,
-                count=3
+                count=3,
+                is_clean_scan=is_clean_scan
             )
             return {
                 "status": "ai_fallback",
                 "products": [],
                 "ai_alternatives": ai_alternatives,
-                "message": "No similar products found in Hippiekit database. Showing AI-recommended alternatives.",
+                "message": "No similar products found in Hippiekit database. Showing AI-recommended alternatives." if not is_clean_scan else "No similar products found. Here are some other options you might like.",
                 "embedding_method": embedding_method
             }
         
@@ -742,7 +748,8 @@ async def get_product_recommendations_for_barcode(
             scanned_product_name=product_name,
             scanned_category=primary_category,
             candidate_products=candidates,
-            min_relevance_score=7  # Out of 10
+            min_relevance_score=7,  # Out of 10
+            is_clean_scan=is_clean_scan
         )
         
         logger.info(f"AI filtered to {len(relevant_products)} relevant products from {len(candidates)} candidates")
@@ -764,13 +771,14 @@ async def get_product_recommendations_for_barcode(
             ai_alternatives = await generate_ai_product_alternatives(
                 product_name=product_name,
                 category=primary_category,
-                count=2
+                count=2,
+                is_clean_scan=is_clean_scan
             )
             return {
                 "status": "partial",
                 "products": relevant_products,
                 "ai_alternatives": ai_alternatives,
-                "message": f"Found {len(relevant_products)} relevant product. Supplemented with AI-recommended alternatives.",
+                "message": f"Found {len(relevant_products)} {'similar' if is_clean_scan else 'relevant'} product. Supplemented with AI recommendations.",
                 "embedding_method": embedding_method
             }
         
@@ -780,13 +788,14 @@ async def get_product_recommendations_for_barcode(
             ai_alternatives = await generate_ai_product_alternatives(
                 product_name=product_name,
                 category=primary_category,
-                count=3
+                count=3,
+                is_clean_scan=is_clean_scan
             )
             return {
                 "status": "ai_fallback",
                 "products": [],
                 "ai_alternatives": ai_alternatives,
-                "message": "No relevant products found in Hippiekit database. Showing AI-recommended healthier alternatives.",
+                "message": "No similar products found. Here are some options you might like." if is_clean_scan else "No relevant products found in Hippiekit database. Showing AI-recommended healthier alternatives.",
                 "embedding_method": embedding_method
             }
         
@@ -798,7 +807,8 @@ async def get_product_recommendations_for_barcode(
             ai_alternatives = await generate_ai_product_alternatives(
                 product_name=product_data.get('name', ''),
                 category=product_data.get('categories', '').split(',')[0].strip() if product_data.get('categories') else '',
-                count=3
+                count=3,
+                is_clean_scan=is_clean_scan
             )
             
             return {
@@ -822,7 +832,8 @@ async def filter_relevant_products(
     scanned_product_name: str,
     scanned_category: str,
     candidate_products: List[Dict[str, Any]],
-    min_relevance_score: int = 7
+    min_relevance_score: int = 7,
+    is_clean_scan: bool = None
 ) -> List[Dict[str, Any]]:
     """
     Use AI to filter out irrelevant product recommendations.
@@ -830,11 +841,14 @@ async def filter_relevant_products(
     Example: If user scanned "Skittles candy", filter out "mattresses" and "straws"
     even if they have visual similarity.
     
+    For CLEAN SCANS: Prioritize exact same product type (olive oil -> olive oils, not castor oil)
+    
     Args:
         scanned_product_name: Name of the scanned product
         scanned_category: Category of scanned product
         candidate_products: List of potential recommendations from Pinecone
         min_relevance_score: Minimum score (1-10) to keep a product
+        is_clean_scan: Whether the scanned product has no harmful ingredients
         
     Returns:
         Filtered list of relevant products only
@@ -851,32 +865,57 @@ async def filter_relevant_products(
             for i, p in enumerate(candidate_products)
         ])
         
+        # Adjust scoring criteria based on clean scan status
+        if is_clean_scan:
+            # For clean products, prioritize EXACT same product type
+            clean_scan_instructions = """
+CLEAN SCAN MODE: This product was scanned and has NO harmful ingredients.
+Instead of recommending "healthier alternatives", recommend SIMILAR PRODUCTS of the SAME TYPE.
+
+STRICT MATCHING RULES:
+- Olive oil scanned → ONLY recommend other olive oils (NOT castor oil, NOT coconut oil)
+- Bottled water scanned → Recommend metal canteens/stainless steel bottles (NOT plastic water bottles)
+- Chocolate bar scanned → Recommend other chocolate bars of the same style
+- The scanned product is ALREADY clean, so show them MORE OPTIONS of the same product type they already like
+
+Score 10 = EXACT same product type (olive oil → olive oil)
+Score 7-9 = Very closely related variant
+Score 1-6 = Different product type (olive oil → castor oil = score 3)
+"""
+        else:
+            clean_scan_instructions = ""
+        
         prompt = f"""You are evaluating product recommendations for a health-conscious consumer.
 
 Scanned Product: "{scanned_product_name}"
 Category: "{scanned_category}"
-
+{clean_scan_instructions}
 Candidate Recommendations (with categories & descriptions):
 {candidates_text}
 
-Task: Rate each candidate's RELEVANCE as a healthier alternative (1-10 scale):
-- 10 = Perfect match (same category, healthier version)
-- 7-9 = Good match (related category, suitable alternative)
+Task: Rate each candidate's RELEVANCE as a {"similar product" if is_clean_scan else "healthier alternative"} (1-10 scale):
+- 10 = Perfect match (same {"product type" if is_clean_scan else "category, healthier version"})
+- 7-9 = Good match ({"closely related variant" if is_clean_scan else "related category, suitable alternative"})
 - 4-6 = Weak match (loosely related)
-- 1-3 = Irrelevant (completely different product category)
+- 1-3 = Irrelevant (completely different product {"type" if is_clean_scan else "category"})
 
 Examples:
-- Scanned "Skittles candy" → Recommend "Organic fruit gummies" (score: 10)
+{'''- Scanned "Organic Olive Oil" → Recommend "Extra Virgin Olive Oil" (score: 10)
+- Scanned "Organic Olive Oil" → Recommend "Cold-Pressed Olive Oil" (score: 10)
+- Scanned "Organic Olive Oil" → Recommend "Castor Oil" (score: 3)
+- Scanned "Smartwater" → Recommend "Stainless Steel Water Bottle" (score: 10)
+- Scanned "Smartwater" → Recommend "Metal Canteen" (score: 10)
+- Scanned "Smartwater" → Recommend "Plastic Water Bottle" (score: 2)''' if is_clean_scan else '''- Scanned "Skittles candy" → Recommend "Organic fruit gummies" (score: 10)
 - Scanned "Skittles candy" → Recommend "Organic chocolate" (score: 8) 
 - Scanned "Skittles candy" → Recommend "Reusable straw" (score: 1)
-- Scanned "Skittles candy" → Recommend "Mattress topper" (score: 1)
+- Scanned "Skittles candy" → Recommend "Mattress topper" (score: 1)'''}
 
 IMPORTANT: Use the categories and descriptions provided to make accurate relevance judgments.
 
 Return ONLY a JSON array of relevance scores (1-10) for each candidate in order:
 [10, 8, 1, 1, ...]
 
-Be strict: Match product categories exactly. Food replaces food. Beauty replaces beauty. Cleaning replaces cleaning. Don't cross categories."""
+Be strict: Match product {"types" if is_clean_scan else "categories"} exactly. {"Same product type only for clean scans." if is_clean_scan else "Food replaces food. Beauty replaces beauty. Cleaning replaces cleaning."} Don't cross categories."""
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -921,15 +960,20 @@ Be strict: Match product categories exactly. Food replaces food. Beauty replaces
 async def generate_ai_product_alternatives(
     product_name: str,
     category: str,
-    count: int = 3
+    count: int = 3,
+    is_clean_scan: bool = None
 ) -> List[Dict[str, Any]]:
     """
     Generate AI-powered product alternatives with brand names when Pinecone search fails.
+    
+    For CLEAN SCANS: Recommend similar products of the same type (not "healthier" alternatives)
+    For HARMFUL SCANS: Recommend healthier alternatives
     
     Args:
         product_name: Name of the scanned product
         category: Product category
         count: Number of alternatives to generate
+        is_clean_scan: Whether the scanned product has no harmful ingredients
         
     Returns:
         List of AI-generated product recommendations:
@@ -946,7 +990,65 @@ async def generate_ai_product_alternatives(
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
-        prompt = f"""You are a health and eco-conscious product expert. A customer scanned "{product_name}" (category: {category}) and it contains harmful additives.
+        if is_clean_scan:
+            # For clean products - recommend SIMILAR products of the SAME TYPE
+            prompt = f"""You are a product expert. A customer scanned "{product_name}" (category: {category}) and it's a CLEAN product with no harmful additives.
+
+Since this product is already clean and healthy, recommend {count} SIMILAR PRODUCTS of the SAME TYPE that they might also enjoy.
+
+CRITICAL RULES:
+1. Use REAL brand names (e.g., "California Olive Ranch", "Bragg's", "Biona", "La Tourangelle")
+2. Match the EXACT product type - if they scanned olive oil, recommend OTHER OLIVE OILS (NOT castor oil, NOT coconut oil)
+3. For water products: Recommend METAL CANTEENS or STAINLESS STEEL BOTTLES (NOT plastic water bottles)
+4. Focus on quality brands they might not know about
+5. Be specific - same product category only
+
+Format as JSON array:
+[
+    {{
+        "name": "Specific Product Name",
+        "brand": "Actual Brand Name",
+        "description": "1-2 sentences explaining what makes this product great - mention quality, certifications, taste, etc."
+    }}
+]
+
+Example (if product was "Organic Olive Oil"):
+[
+    {{
+        "name": "Extra Virgin Olive Oil",
+        "brand": "California Olive Ranch",
+        "description": "Award-winning California olive oil made from sustainably grown olives. Fresh, fruity flavor with a smooth finish. Certified extra virgin."
+    }},
+    {{
+        "name": "Organic Extra Virgin Olive Oil",
+        "brand": "Bragg's",
+        "description": "USDA certified organic olive oil cold-pressed from organic olives. Rich in antioxidants and healthy fats."
+    }},
+    {{
+        "name": "Italian Extra Virgin Olive Oil",
+        "brand": "La Tourangelle",
+        "description": "Traditional stone-pressed olive oil from Italy. Full-bodied flavor perfect for cooking and dressings."
+    }}
+]
+
+Example (if product was "Bottled Water"):
+[
+    {{
+        "name": "Insulated Stainless Steel Water Bottle",
+        "brand": "Hydro Flask",
+        "description": "BPA-free stainless steel bottle keeps drinks cold for 24 hours. Durable, eco-friendly alternative to single-use plastic."
+    }},
+    {{
+        "name": "Stainless Steel Canteen",
+        "brand": "Klean Kanteen",
+        "description": "Sustainable stainless steel bottle. Climate Neutral Certified. Keeps water fresh without plastic chemicals."
+    }}
+]
+
+Now generate {count} SIMILAR products for "{product_name}" (category: {category}):"""
+        else:
+            # For harmful products - recommend healthier alternatives
+            prompt = f"""You are a health and eco-conscious product expert. A customer scanned "{product_name}" (category: {category}) and it contains harmful additives.
 
 Recommend {count} REAL, SPECIFIC healthier alternative products with ACTUAL BRAND NAMES that they can buy instead.
 
@@ -1072,12 +1174,12 @@ async def separate_ingredients_with_ai(
     harmful_chemicals_db: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
     """
-    Use OpenAI to intelligently PARSE and categorize ingredients as harmful or safe.
+    Use OpenAI to intelligently PARSE and categorize ingredients as harmful, questionable, or safe.
     
     The AI will:
     1. Parse the raw ingredients text (handling parentheses, nested ingredients, etc.)
     2. Extract individual ingredients correctly
-    3. Categorize each as harmful or safe based on curated harmful chemicals database
+    3. Categorize each as harmful, questionable, or safe based on curated harmful chemicals database
     
     Args:
         ingredients_text: Raw ingredients text from product label (unparsed)
@@ -1086,6 +1188,7 @@ async def separate_ingredients_with_ai(
     Returns:
         {
             "harmful": ["Red 40", "Yellow 5", ...],
+            "questionable": ["Calcium Chloride", "Potassium Bicarbonate", ...],
             "safe": ["Cocoa Butter", "Water", ...]
         }
     """
@@ -1093,7 +1196,7 @@ async def separate_ingredients_with_ai(
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
         if not ingredients_text or not ingredients_text.strip():
-            return {"harmful": [], "safe": []}
+            return {"harmful": [], "questionable": [], "safe": []}
         
         logger.info(f"Raw ingredients text: {ingredients_text[:200]}...")
         
@@ -1114,7 +1217,7 @@ TASKS:
    - cocoa butter
    - soy lecithin
 
-2. CATEGORIZE each ingredient as HARMFUL or SAFE based on health and environmental impact.
+2. CATEGORIZE each ingredient as HARMFUL, QUESTIONABLE, or SAFE based on health and environmental impact.
 
 === HARMFUL CHEMICALS DATABASE (MUST FLAG) ===
 The following comprehensive database contains chemicals that MUST be flagged as harmful.
@@ -1142,17 +1245,28 @@ ALWAYS FLAG AS HARMFUL:
 ✗ Heavily processed ingredients (protein isolates, concentrates, etc.)
 ✗ Ingredients with known health risks (endocrine disruptors, carcinogens, allergens)
 
+MARK AS QUESTIONABLE (not harmful, but not "clean" - synthetic additives):
+⚠️ Synthetic mineral additives used in processed waters and foods:
+   - Calcium Chloride, Magnesium Chloride, Potassium Bicarbonate, Sodium Selenate
+   - Potassium Chloride, Magnesium Sulfate, Calcium Sulfate
+   - Sodium Phosphate, Potassium Phosphate
+⚠️ Industrial-grade additives used as pH buffers or mineral fortification
+⚠️ Ingredients that are FDA-approved but not naturally sourced
+⚠️ Synthetic vitamins when the source is clearly industrial (e.g., "sodium selenate" vs natural selenium)
+⚠️ These are common in "enhanced" or "alkaline" waters - approved for use but not ideal for those seeking natural, plant-based products
+
 MARK AS SAFE:
 ✓ Water, sea salt, Himalayan salt
 ✓ Whole food ingredients (even if not organic): cocoa, milk, butter, eggs, flour, oats, rice, fruits, vegetables
 ✓ Natural oils: olive oil, coconut oil, avocado oil, butter, ghee
 ✓ Natural sweeteners: honey, maple syrup, stevia, monk fruit, coconut sugar (even if not organic)
 ✓ Basic ingredients: baking soda, baking powder, vanilla extract, cocoa powder, chocolate
-✓ Vitamins and minerals (Vitamin C, Vitamin E, Calcium, Iron, etc.)
+✓ Vitamins and minerals from natural sources (Vitamin C, Vitamin E, naturally-sourced Calcium, Iron, etc.)
 ✓ Natural extracts and spices (unless flagged in database)
 ✓ Eggs, milk, dairy (even if not organic)
 ✓ Grains and legumes (wheat, soy, corn as ingredients - not as oils)
 ✓ Natural thickeners: pectin, agar, gelatin
+✓ Vapor distilled water, purified water, spring water
 
 CRITICAL RULES:
 • Ingredient names may vary: "Red 40" = "Allura Red" = "E129" = "Red dye 40"
@@ -1161,23 +1275,25 @@ CRITICAL RULES:
 • "Fragrance" ALWAYS harmful (undisclosed mix)
 • Sugar IS harmful (flag it)
 • Non-organic ingredients are OK unless they're processed/synthetic
+• Synthetic mineral salts (chlorides, bicarbonates, phosphates for fortification) = QUESTIONABLE
 • When in doubt about matching database: compare category and function
 
 OUTPUT FORMAT:
 Return ONLY valid JSON with NO explanations:
 {{
     "harmful": ["ingredient1", "ingredient2"],
-    "safe": ["ingredient3", "ingredient4"]
+    "questionable": ["ingredient3", "ingredient4"],
+    "safe": ["ingredient5", "ingredient6"]
 }}
 
 Each ingredient name should NOT include parentheses or descriptions.
-Every ingredient must appear in exactly ONE list (harmful OR safe, never both).
+Every ingredient must appear in exactly ONE list (harmful, questionable, OR safe - never in multiple).
 """
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",  # Faster and cheaper for this task
             messages=[
-                {"role": "system", "content": "You are an expert at parsing ingredient labels and identifying harmful chemicals. You understand ingredient aliases, chemical names, E-numbers, and can semantically match ingredients to a harmful chemicals database. You always return valid JSON only."},
+                {"role": "system", "content": "You are an expert at parsing ingredient labels and identifying harmful chemicals. You understand ingredient aliases, chemical names, E-numbers, and can semantically match ingredients to a harmful chemicals database. You categorize ingredients into three tiers: harmful (avoid), questionable (synthetic but approved), and safe (natural/clean). You always return valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,  # Slightly higher for better semantic matching
@@ -1193,42 +1309,51 @@ Every ingredient must appear in exactly ONE list (harmful OR safe, never both).
         
         result = json.loads(content)
         
-        logger.info(f"AI parsed and separated ingredients: {len(result.get('harmful', []))} harmful, {len(result.get('safe', []))} safe")
+        # Ensure questionable key exists (for backwards compatibility)
+        if "questionable" not in result:
+            result["questionable"] = []
+        
+        logger.info(f"AI parsed and separated ingredients: {len(result.get('harmful', []))} harmful, {len(result.get('questionable', []))} questionable, {len(result.get('safe', []))} safe")
         
         return result
         
     except Exception as e:
         logger.error(f"AI ingredient parsing/separation failed: {e}")
-        return {"harmful": [], "safe": []}
-        # Fallback to empty lists
-        return {"harmful": [], "safe": []}
+        return {"harmful": [], "questionable": [], "safe": []}
 
 
 def get_detailed_ingredient_descriptions(
     safe_ingredients: list, 
     harmful_ingredients: list,
-    harmful_chemicals_db: list
+    harmful_chemicals_db: list,
+    questionable_ingredients: list = None
 ) -> dict:
     """
     Generate detailed, user-friendly AI descriptions for ALREADY SEPARATED ingredients.
     
-    OPTIMIZED: Uses a SINGLE batched OpenAI API call for both harmful and safe ingredients.
+    OPTIMIZED: Uses a SINGLE batched OpenAI API call for harmful, questionable, and safe ingredients.
     
     Args:
         safe_ingredients: List of safe ingredient names (from AI separation)
         harmful_ingredients: List of harmful ingredient names (from AI separation)
         harmful_chemicals_db: Database of harmful chemicals (for context in descriptions)
+        questionable_ingredients: List of questionable ingredient names (synthetic but approved)
     
     Returns:
         {
             "safe": {"ingredient_name": "detailed description"},
-            "harmful": {"chemical_name": "detailed harmful description"}
+            "harmful": {"chemical_name": "detailed harmful description"},
+            "questionable": {"ingredient_name": "nuanced description about synthetic nature"}
         }
     """
     try:
+        # Handle None for backwards compatibility
+        if questionable_ingredients is None:
+            questionable_ingredients = []
+        
         # If no ingredients to describe, return early
-        if not harmful_ingredients and not safe_ingredients:
-            return {"safe": {}, "harmful": {}}
+        if not harmful_ingredients and not safe_ingredients and not questionable_ingredients:
+            return {"safe": {}, "harmful": {}, "questionable": {}}
         
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
@@ -1247,28 +1372,36 @@ def get_detailed_ingredient_descriptions(
                 harmful_items.append(f"{ing_name} (AI flagged as harmful)")
         
         harmful_str = ", ".join(harmful_items) if harmful_items else "None"
+        questionable_str = ", ".join(questionable_ingredients[:10]) if questionable_ingredients else "None"
         safe_str = ", ".join(safe_ingredients[:20]) if safe_ingredients else "None"
         
-        logger.info(f"[BATCHED] Generating descriptions for {len(harmful_ingredients)} harmful + {len(safe_ingredients)} safe ingredients in ONE API call")
+        logger.info(f"[BATCHED] Generating descriptions for {len(harmful_ingredients)} harmful + {len(questionable_ingredients)} questionable + {len(safe_ingredients)} safe ingredients in ONE API call")
         
-        # SINGLE BATCHED PROMPT for both harmful and safe
-        batched_prompt = f"""Analyze these ingredients from a consumer product. Provide descriptions for BOTH harmful AND safe ingredients in a single response.
+        # SINGLE BATCHED PROMPT for harmful, questionable, and safe
+        batched_prompt = f"""Analyze these ingredients from a consumer product. Provide descriptions for harmful, questionable, AND safe ingredients in a single response.
 
 === HARMFUL INGREDIENTS (be critical, explain dangers) ===
 {harmful_str}
+
+=== QUESTIONABLE INGREDIENTS (synthetic additives - approved but not natural) ===
+{questionable_str}
 
 === SAFE INGREDIENTS (be educational, honest about processing) ===
 {safe_str}
 
 INSTRUCTIONS:
 1. For HARMFUL ingredients: Explain what it is, why it's harmful, health/environmental risks. Be uncompromising.
-2. For SAFE ingredients: Brief 1-2 sentence educational description. Natural = positive, processed = honest critique.
-3. Use exact ingredient names as JSON keys.
+2. For QUESTIONABLE ingredients: Explain these are common synthetic additives found in processed foods/waters. They're FDA-approved for use but not ideal for daily consumption if aiming for natural, plant-based products. Mention they're often used in industrial applications and not naturally sourced minerals.
+3. For SAFE ingredients: Brief 1-2 sentence educational description. Natural = positive, processed = honest critique.
+4. Use exact ingredient names as JSON keys.
 
 Return ONLY this JSON structure:
 {{
     "harmful": {{
         "Ingredient Name": "Critical description of why this is harmful..."
+    }},
+    "questionable": {{
+        "Ingredient Name": "Nuanced description about synthetic nature and industrial origins..."
     }},
     "safe": {{
         "Ingredient Name": "Brief educational description..."
@@ -1288,6 +1421,13 @@ For HARMFUL ingredients:
 • Never say "safe in small amounts" or cite regulatory approval
 • E-numbers, dyes, artificial flavors = always problematic
 
+For QUESTIONABLE ingredients:
+• These are synthetic mineral additives commonly used in processed waters and foods
+• Explain they're FDA-approved but not naturally sourced
+• Mention industrial origins (e.g., "commonly used in de-icers", "used in concrete")
+• Note they're not ideal for those seeking natural, plant-based products
+• Be informative, not alarmist - these aren't harmful, just not "clean"
+
 For SAFE ingredients:
 • Natural = positive descriptions
 • Ultra-processed = honest critique
@@ -1298,7 +1438,7 @@ Output ONLY valid JSON with the exact structure requested."""
                 {"role": "user", "content": batched_prompt}
             ],
             temperature=0.3,
-            max_tokens=3000
+            max_tokens=3500
         )
         
         content = response.choices[0].message.content.strip()
@@ -1312,21 +1452,24 @@ Output ONLY valid JSON with the exact structure requested."""
         result = json.loads(content)
         
         harmful_descriptions = result.get("harmful", {})
+        questionable_descriptions = result.get("questionable", {})
         safe_descriptions = result.get("safe", {})
         
-        logger.info(f"[BATCHED] Generated {len(harmful_descriptions)} harmful + {len(safe_descriptions)} safe descriptions in ONE call")
+        logger.info(f"[BATCHED] Generated {len(harmful_descriptions)} harmful + {len(questionable_descriptions)} questionable + {len(safe_descriptions)} safe descriptions in ONE call")
         
         return {
             "safe": safe_descriptions,
-            "harmful": harmful_descriptions
+            "harmful": harmful_descriptions,
+            "questionable": questionable_descriptions
         }
         
     except Exception as e:
         logger.error(f"Error in get_detailed_ingredient_descriptions (batched): {e}", exc_info=True)
         # Fallback to basic descriptions
         harmful_descriptions = {ing: "This ingredient has been flagged as potentially harmful." for ing in harmful_ingredients}
+        questionable_descriptions = {ing: "This is a synthetic additive that is FDA-approved but not naturally sourced. Common in processed waters and foods." for ing in (questionable_ingredients or [])}
         safe_descriptions = {ing: "Common ingredient used in consumer products." for ing in safe_ingredients}
-        return {"safe": safe_descriptions, "harmful": harmful_descriptions}
+        return {"safe": safe_descriptions, "harmful": harmful_descriptions, "questionable": questionable_descriptions}
 
 
 # === ASYNC PARALLEL VERSIONS FOR OPTIMIZED PERFORMANCE ===
@@ -1944,18 +2087,20 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
         # === AI PARSING + SEPARATION ===
         # Let AI parse and separate ingredients in one step
         harmful_ingredient_names = []
+        questionable_ingredient_names = []
         safe_ingredient_names = []
         
         if ingredients_text and ingredients_text.strip():
             logger.info(f"Parsing and separating ingredients with AI")
             
-            # Use AI to parse AND intelligently separate harmful vs safe
+            # Use AI to parse AND intelligently separate harmful vs questionable vs safe
             separated = await separate_ingredients_with_ai(ingredients_text, [])
             
             harmful_ingredient_names = separated.get("harmful", [])
+            questionable_ingredient_names = separated.get("questionable", [])
             safe_ingredient_names = separated.get("safe", [])
             
-            logger.info(f"AI parsing and separation complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+            logger.info(f"AI parsing and separation complete: {len(harmful_ingredient_names)} harmful, {len(questionable_ingredient_names)} questionable, {len(safe_ingredient_names)} safe")
         
         # Build harmful chemicals list from AI separation
         # No need for safety score calculation - not used in frontend
@@ -1968,6 +2113,16 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
             for name in harmful_ingredient_names
         ]
         
+        # Build questionable chemicals list
+        questionable_chemicals = [
+            {
+                "name": name,
+                "type": "synthetic_additive",
+                "category": "Synthetic Minerals",
+            }
+            for name in questionable_ingredient_names
+        ]
+        
         # No recommendations needed here - they're fetched separately via /barcode/recommendations endpoint
         # This saves processing time on the main barcode lookup
         
@@ -1975,11 +2130,14 @@ async def lookup_barcode(request: BarcodeLookupRequest) -> Dict[str, Any]:
         product_data["chemical_analysis"] = {
             "harmful_chemicals": harmful_chemicals,
             "harmful_count": len(harmful_chemicals),
+            "questionable_chemicals": questionable_chemicals,
+            "questionable_count": len(questionable_chemicals),
         }
         
         # Store separated lists (no duplicates - AI handles the separation)
         product_data["ingredients"] = safe_ingredient_names
         product_data["harmful_ingredients"] = harmful_ingredient_names
+        product_data["questionable_ingredients"] = questionable_ingredient_names
         
         # === EXTRACT PACKAGING INFO BEFORE PARALLEL EXECUTION ===
         packaging_text = product_data.get("packaging", "")
@@ -2252,6 +2410,7 @@ class IngredientsDescribeRequest(BaseModel):
     """Request model for ingredient descriptions"""
     barcode: str
     harmful_ingredients: list[str]
+    questionable_ingredients: list[str] = []  # Optional for backwards compatibility
     safe_ingredients: list[str]
 
 
@@ -2343,6 +2502,7 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
                 'success': True,
                 'has_ingredients': False,
                 'harmful': [],
+                'questionable': [],
                 'safe': [],
                 'message': 'No ingredients found'
             }
@@ -2352,18 +2512,21 @@ async def separate_ingredients(request: IngredientsSeparateRequest) -> Dict[str,
         separated = await separate_ingredients_with_ai(ingredients_text, [])
         
         harmful_ingredient_names = separated.get("harmful", [])
+        questionable_ingredient_names = separated.get("questionable", [])
         safe_ingredient_names = separated.get("safe", [])
         
-        logger.info(f"[INGREDIENTS-SEPARATE] Complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+        logger.info(f"[INGREDIENTS-SEPARATE] Complete: {len(harmful_ingredient_names)} harmful, {len(questionable_ingredient_names)} questionable, {len(safe_ingredient_names)} safe")
         
-        total_ingredients = len(harmful_ingredient_names) + len(safe_ingredient_names)
+        total_ingredients = len(harmful_ingredient_names) + len(questionable_ingredient_names) + len(safe_ingredient_names)
         
         return {
             'success': True,
             'has_ingredients': True,
             'harmful': harmful_ingredient_names,
+            'questionable': questionable_ingredient_names,
             'safe': safe_ingredient_names,
             'harmful_count': len(harmful_ingredient_names),
+            'questionable_count': len(questionable_ingredient_names),
             'safe_count': len(safe_ingredient_names),
             'total_count': total_ingredients,
             'message': f'Parsed and separated {total_ingredients} ingredients'
@@ -2383,7 +2546,7 @@ async def describe_ingredients(request: IngredientsDescribeRequest) -> Dict[str,
     Takes 3-5 seconds. Call after /separate to get detailed descriptions.
     
     Args:
-        request: Contains harmful and safe ingredient lists
+        request: Contains harmful, questionable, and safe ingredient lists
         
     Returns:
         AI-generated descriptions for each ingredient
@@ -2394,7 +2557,7 @@ async def describe_ingredients(request: IngredientsDescribeRequest) -> Dict[str,
         if not barcode or not barcode.isdigit():
             raise HTTPException(status_code=400, detail="Invalid barcode")
         
-        logger.info(f"[INGREDIENTS-DESCRIBE] Generating descriptions for {len(request.harmful_ingredients)} harmful, {len(request.safe_ingredients)} safe ingredients")
+        logger.info(f"[INGREDIENTS-DESCRIBE] Generating descriptions for {len(request.harmful_ingredients)} harmful, {len(request.questionable_ingredients)} questionable, {len(request.safe_ingredients)} safe ingredients")
         
         # Generate harmful chemicals list
         harmful_chemicals = [
@@ -2402,11 +2565,12 @@ async def describe_ingredients(request: IngredientsDescribeRequest) -> Dict[str,
             for name in request.harmful_ingredients
         ]
         
-        # GENERATE DESCRIPTIONS (SLOW - 2 AI calls)
+        # GENERATE DESCRIPTIONS (SLOW - 1 batched AI call)
         ingredient_descriptions = get_detailed_ingredient_descriptions(
             safe_ingredients=request.safe_ingredients,
             harmful_ingredients=request.harmful_ingredients,
-            harmful_chemicals_db=harmful_chemicals
+            harmful_chemicals_db=harmful_chemicals,
+            questionable_ingredients=request.questionable_ingredients
         )
         
         logger.info(f"[INGREDIENTS-DESCRIBE] Descriptions generated")
@@ -2497,8 +2661,9 @@ async def analyze_ingredients(request: IngredientsAnalyzeRequest) -> Dict[str, A
                 'success': True,
                 'has_ingredients': False,
                 'harmful': [],
+                'questionable': [],
                 'safe': [],
-                'descriptions': {'harmful': {}, 'safe': {}},
+                'descriptions': {'harmful': {}, 'questionable': {}, 'safe': {}},
                 'message': 'No ingredients found for analysis'
             }
         
@@ -2507,9 +2672,10 @@ async def analyze_ingredients(request: IngredientsAnalyzeRequest) -> Dict[str, A
         separated = await separate_ingredients_with_ai(ingredients_text, [])
         
         harmful_ingredient_names = separated.get("harmful", [])
+        questionable_ingredient_names = separated.get("questionable", [])
         safe_ingredient_names = separated.get("safe", [])
         
-        logger.info(f"[INGREDIENTS] AI separation: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+        logger.info(f"[INGREDIENTS] AI separation: {len(harmful_ingredient_names)} harmful, {len(questionable_ingredient_names)} questionable, {len(safe_ingredient_names)} safe")
         
         # Generate harmful chemicals list
         harmful_chemicals = [
@@ -2522,19 +2688,22 @@ async def analyze_ingredients(request: IngredientsAnalyzeRequest) -> Dict[str, A
         ingredient_descriptions = get_detailed_ingredient_descriptions(
             safe_ingredients=safe_ingredient_names,
             harmful_ingredients=harmful_ingredient_names,
-            harmful_chemicals_db=harmful_chemicals
+            harmful_chemicals_db=harmful_chemicals,
+            questionable_ingredients=questionable_ingredient_names
         )
         
         logger.info(f"[INGREDIENTS] Analysis complete")
         
-        total_ingredients = len(harmful_ingredient_names) + len(safe_ingredient_names)
+        total_ingredients = len(harmful_ingredient_names) + len(questionable_ingredient_names) + len(safe_ingredient_names)
         
         return {
             'success': True,
             'has_ingredients': True,
             'harmful': harmful_ingredient_names,
+            'questionable': questionable_ingredient_names,
             'safe': safe_ingredient_names,
             'harmful_count': len(harmful_ingredient_names),
+            'questionable_count': len(questionable_ingredient_names),
             'safe_count': len(safe_ingredient_names),
             'descriptions': ingredient_descriptions,
             'message': f'Analyzed {total_ingredients} ingredients'
@@ -3096,11 +3265,36 @@ async def get_barcode_recommendations(request: BarcodeLookupRequest) -> Dict[str
                 'message': 'Product not found'
             }
         
+        # Auto-determine is_clean_scan if not provided by checking ingredients AND packaging
+        is_clean_scan = request.is_clean_scan
+        if is_clean_scan is None:
+            # Check if product has harmful ingredients
+            ingredients_text = product_data.get("ingredients_text", "") or product_data.get("ingredients", "")
+            if isinstance(ingredients_text, list):
+                ingredients_text = ", ".join(ingredients_text)
+            
+            harmful_count = 0
+            if ingredients_text:
+                detected_chemicals = check_ingredients(ingredients_text)
+                # Consider "clean" if no CRITICAL or HIGH severity chemicals found
+                harmful_severities = ["critical", "high"]
+                harmful_count = sum(1 for c in detected_chemicals if c.get("severity") in harmful_severities)
+            
+            # Also check packaging - if it contains "plastic", it's not a clean scan
+            packaging = product_data.get("packaging", "") or product_data.get("packaging_tags", "")
+            if isinstance(packaging, list):
+                packaging = ", ".join(packaging)
+            has_plastic_packaging = "plastic" in packaging.lower() if packaging else False
+            
+            is_clean_scan = harmful_count == 0 and not has_plastic_packaging
+            logger.info(f"Auto-determined is_clean_scan={is_clean_scan} (harmful: {harmful_count}, plastic_packaging: {has_plastic_packaging})")
+        
         # Get recommendations
         recommendations = await get_product_recommendations_for_barcode(
             product_data=product_data,
             top_k=3,
-            min_score=0.4  # Lower threshold for barcode products
+            min_score=0.4,  # Lower threshold for barcode products
+            is_clean_scan=is_clean_scan
         )
         
         return {

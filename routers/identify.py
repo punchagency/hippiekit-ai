@@ -225,31 +225,34 @@ async def merge_database_and_vision(
     category = db_data.get('categories', '').split(',')[0] if db_data.get('categories') else vision_data.get('category')
     recommendations = generate_recommendations(chemical_flags, category)
     
-    # Get ingredient descriptions with AI separation (ensures no duplicates between safe/harmful)
+    # Get ingredient descriptions with AI separation (ensures no duplicates between safe/harmful/questionable)
     ingredients_list = [ing.strip() for ing in ingredients_text.split(',')] if ingredients_text else []
     
     if ingredients_list:
         logger.info(f"Separating {len(ingredients_list)} ingredients with AI intelligent matching")
         
-        # Use AI to intelligently separate harmful vs safe (handles name variations automatically)
+        # Use AI to intelligently separate harmful vs questionable vs safe (handles name variations automatically)
         # Pass the original text, not the list
         separated = await separate_ingredients_with_ai(ingredients_text, chemical_flags)
         
         harmful_ingredient_names = separated.get("harmful", [])
+        questionable_ingredient_names = separated.get("questionable", [])
         safe_ingredient_names = separated.get("safe", [])
         
-        logger.info(f"AI separation complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+        logger.info(f"AI separation complete: {len(harmful_ingredient_names)} harmful, {len(questionable_ingredient_names)} questionable, {len(safe_ingredient_names)} safe")
         
         # Generate detailed descriptions using AI-separated lists
         ingredient_descriptions = get_detailed_ingredient_descriptions(
             safe_ingredients=safe_ingredient_names,
             harmful_ingredients=harmful_ingredient_names,
-            harmful_chemicals_db=chemical_flags
+            harmful_chemicals_db=chemical_flags,
+            questionable_ingredients=questionable_ingredient_names
         )
     else:
         harmful_ingredient_names = []
+        questionable_ingredient_names = []
         safe_ingredient_names = []
-        ingredient_descriptions = {"safe": {}, "harmful": {}}
+        ingredient_descriptions = {"safe": {}, "harmful": {}, "questionable": {}}
     
     # Analyze packaging materials with OpenAI web search fallback
     packaging_text = db_data.get('packaging', '') or vision_data.get('container_info', {}).get('material', '')
@@ -291,6 +294,7 @@ async def merge_database_and_vision(
         "barcode": db_data.get('code', ''),
         "ingredients": safe_ingredient_names,  # Only safe ingredients
         "harmful_ingredients": harmful_ingredient_names,  # Only harmful ingredients
+        "questionable_ingredients": questionable_ingredient_names,  # Synthetic but approved ingredients
         "nutrition": db_data.get('nutrition', {}),
         "marketing_claims": vision_data.get('marketing_claims', []),
         "certifications_visible": vision_data.get('certifications_visible', []),
@@ -382,31 +386,34 @@ async def ai_only_analysis(image_bytes: bytes, product_info: dict) -> dict:
     safety_score = calculate_safety_score(chemical_flags)
     recommendations = generate_recommendations(chemical_flags, category)
     
-    # Get ingredient descriptions with AI separation (ensures no duplicates between safe/harmful)
+    # Get ingredient descriptions with AI separation (ensures no duplicates between safe/harmful/questionable)
     ingredients_list = [ing.strip() for ing in ingredients_text.split(',')] if ingredients_text and ingredients_text != "Could not extract ingredients from image" else []
     
     if ingredients_list:
         logger.info(f"Separating {len(ingredients_list)} ingredients with AI intelligent matching")
         
-        # Use AI to intelligently separate harmful vs safe (handles name variations automatically)
+        # Use AI to intelligently separate harmful vs questionable vs safe (handles name variations automatically)
         # Pass the original text, not the list
         separated = await separate_ingredients_with_ai(ingredients_text, chemical_flags)
         
         harmful_ingredient_names = separated.get("harmful", [])
+        questionable_ingredient_names = separated.get("questionable", [])
         safe_ingredient_names = separated.get("safe", [])
         
-        logger.info(f"AI separation complete: {len(harmful_ingredient_names)} harmful, {len(safe_ingredient_names)} safe")
+        logger.info(f"AI separation complete: {len(harmful_ingredient_names)} harmful, {len(questionable_ingredient_names)} questionable, {len(safe_ingredient_names)} safe")
         
         # Generate detailed descriptions using AI-separated lists
         ingredient_descriptions = get_detailed_ingredient_descriptions(
             safe_ingredients=safe_ingredient_names,
             harmful_ingredients=harmful_ingredient_names,
-            harmful_chemicals_db=chemical_flags
+            harmful_chemicals_db=chemical_flags,
+            questionable_ingredients=questionable_ingredient_names
         )
     else:
         harmful_ingredient_names = []
+        questionable_ingredient_names = []
         safe_ingredient_names = []
-        ingredient_descriptions = {"safe": {}, "harmful": {}}
+        ingredient_descriptions = {"safe": {}, "harmful": {}, "questionable": {}}
     
     # Analyze packaging materials with OpenAI web search fallback
     packaging_text = product_info.get('container_info', {}).get('material', '')
@@ -442,6 +449,7 @@ async def ai_only_analysis(image_bytes: bytes, product_info: dict) -> dict:
         "product_type": product_info.get('product_type', ''),
         "ingredients": safe_ingredient_names,  # Only safe ingredients
         "harmful_ingredients": harmful_ingredient_names,  # Only harmful ingredients
+        "questionable_ingredients": questionable_ingredient_names,  # Synthetic but approved ingredients
         "marketing_claims": product_info.get('marketing_claims', []),
         "certifications_visible": product_info.get('certifications_visible', []),
         "container_info": product_info.get('container_info', {}),
@@ -490,6 +498,7 @@ def get_chemical_explanation(category: str) -> str:
         "Pesticides": "Toxic agricultural chemical with potential carcinogenic effects",
         "Heavy Metals": "Toxic metal that accumulates in body and causes organ damage",
         "Sunscreen": "Chemical UV filter that may disrupt hormones and harm coral reefs",
+        "Synthetic Minerals": "Synthetic mineral additive commonly used in industrial applications. Approved for use but not naturally sourced.",
     }
     return explanations.get(category, f"{category} chemical with potential health concerns")
 
@@ -716,6 +725,7 @@ async def separate_photo_ingredients(
                     logger.warning(f"Could not find or infer ingredients for {brand} {product_name}")
                     return {
                         "harmful": [],
+                        "questionable": [],
                         "safe": [],
                         "data_source": "none",
                         "message": "Could not find ingredient information"
@@ -728,12 +738,13 @@ async def separate_photo_ingredients(
         separated = await separate_ingredients_with_ai(ingredients_text, chemical_flags)
         
         elapsed_time = time.time() - start_time
-        logger.info(f"Separated: {len(separated.get('harmful', []))} harmful, {len(separated.get('safe', []))} safe")
+        logger.info(f"Separated: {len(separated.get('harmful', []))} harmful, {len(separated.get('questionable', []))} questionable, {len(separated.get('safe', []))} safe")
         logger.info(f"⏱️ /ingredients/separate completed in {elapsed_time:.2f}s")
         
         # Build result
         result = {
             "harmful": separated.get("harmful", []),
+            "questionable": separated.get("questionable", []),
             "safe": separated.get("safe", []),
             "data_source": data_source,
             "ingredients_text": ingredients_text,  # Return for future calls
@@ -754,6 +765,7 @@ async def separate_photo_ingredients(
 @router.post("/ingredients/describe")
 async def describe_photo_ingredients(
     harmful_ingredients: str = Form(""),  # Comma-separated list (optional)
+    questionable_ingredients: str = Form(""),  # Comma-separated list (optional)
     safe_ingredients: str = Form("")  # Comma-separated list (optional)
 ):
     """
@@ -766,25 +778,28 @@ async def describe_photo_ingredients(
     try:
         # Parse comma-separated lists
         harmful_list = [ing.strip() for ing in harmful_ingredients.split(',') if ing.strip()]
+        questionable_list = [ing.strip() for ing in questionable_ingredients.split(',') if ing.strip()]
         safe_list = [ing.strip() for ing in safe_ingredients.split(',') if ing.strip()]
         
         # If no ingredients provided, return empty descriptions
-        if not harmful_list and not safe_list:
+        if not harmful_list and not questionable_list and not safe_list:
             logger.warning("No ingredients provided for description")
             return {
                 "descriptions": {
                     "harmful": {},
+                    "questionable": {},
                     "safe": {}
                 }
             }
         
-        logger.info(f"Generating descriptions for {len(harmful_list)} harmful + {len(safe_list)} safe ingredients")
+        logger.info(f"Generating descriptions for {len(harmful_list)} harmful + {len(questionable_list)} questionable + {len(safe_list)} safe ingredients")
         
         # Generate descriptions
         descriptions = get_detailed_ingredient_descriptions(
             safe_ingredients=safe_list,
             harmful_ingredients=harmful_list,
-            harmful_chemicals_db=[]  # Descriptions don't need chemical flags
+            harmful_chemicals_db=[],  # Descriptions don't need chemical flags
+            questionable_ingredients=questionable_list
         )
         
         elapsed_time = time.time() - start_time
