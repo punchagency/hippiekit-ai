@@ -17,6 +17,360 @@ QUESTIONABLE = "questionable"  # -3 points (not harmful, but not "clean" - synth
 LOW = "low"                # -2 points
 
 
+# ========== SUSTAINABLE PACKAGING DEFINITIONS ==========
+# Materials that are eco-friendly and acceptable for Hippiekit recommendations
+
+SUSTAINABLE_PACKAGING_MATERIALS = {
+    # Glass - infinitely recyclable, no chemical leaching
+    "glass",
+    "glass bottle",
+    "glass jar",
+    "amber glass",
+    "recycled glass",
+    
+    # Metal - highly recyclable
+    "aluminum",
+    "aluminium",
+    "aluminum can",
+    "steel",
+    "stainless steel",
+    "tin",
+    "metal",
+    "metal can",
+    "metal tin",
+    
+    # Paper & Cardboard - biodegradable
+    "paper",
+    "cardboard",
+    "paperboard",
+    "kraft paper",
+    "recycled paper",
+    "recycled cardboard",
+    "paper bag",
+    "paper wrap",
+    "paper carton",
+    "cardboard box",
+    
+    # Compostable/Biodegradable materials
+    "compostable",
+    "biodegradable",
+    "plant-based packaging",
+    "bamboo",
+    "wood",
+    "wooden",
+    "cork",
+    "hemp",
+    "cotton",
+    "jute",
+    "burlap",
+    "beeswax wrap",
+    
+    # Sustainable alternatives
+    "refillable",
+    "reusable",
+    "zero waste",
+    "package-free",
+    "bulk",
+    "naked packaging",
+}
+
+# Materials that are NOT sustainable and should be avoided
+NON_SUSTAINABLE_PACKAGING_MATERIALS = {
+    # Plastics
+    "plastic",
+    "plastic bottle",
+    "plastic bag",
+    "plastic wrap",
+    "plastic container",
+    "plastic pouch",
+    "plastic tub",
+    "shrink wrap",
+    "cling film",
+    "cling wrap",
+    "cellophane",  # Most commercial cellophane is plastic
+    
+    # Specific plastic types
+    "pet",
+    "pete",
+    "hdpe",
+    "pvc",
+    "ldpe",
+    "pp",
+    "polypropylene",
+    "polystyrene",
+    "styrofoam",
+    "eps",  # Expanded polystyrene
+    "bpa",
+    "bps",
+    "polycarbonate",
+    "vinyl",
+    
+    # Plastic numbers
+    "plastic #1",
+    "plastic #2",
+    "plastic #3",
+    "plastic #4",
+    "plastic #5",
+    "plastic #6",
+    "plastic #7",
+    
+    # Mixed materials (hard to recycle)
+    "tetra pak",  # While better than plastic, still problematic
+    "foil-lined",
+    "multi-layer",
+    "laminated",
+    
+    # Single-use items
+    "single-use",
+    "disposable plastic",
+    "blister pack",
+}
+
+# Keywords that indicate sustainable/eco-friendly products
+SUSTAINABILITY_POSITIVE_KEYWORDS = {
+    "organic",
+    "usda organic",
+    "certified organic",
+    "non-gmo",
+    "non gmo",
+    "eco-friendly",
+    "eco friendly",
+    "sustainable",
+    "sustainably sourced",
+    "fair trade",
+    "fairtrade",
+    "plastic-free",
+    "plastic free",
+    "zero waste",
+    "refillable",
+    "reusable",
+    "biodegradable",
+    "compostable",
+    "recyclable",
+    "recycled",
+    "glass bottle",
+    "glass jar",
+    "aluminum",
+    "bpa-free",
+    "bpa free",
+    "phthalate-free",
+    "phthalate free",
+    "natural",
+    "plant-based",
+    "vegan",
+    "cruelty-free",
+    "cruelty free",
+    "b corp",
+    "b-corp",
+    "ewg verified",
+    "made safe",
+    "clean label",
+    "green certified",
+    "carbon neutral",
+    "climate neutral",
+}
+
+# Keywords that indicate unsustainable products (should avoid recommending)
+SUSTAINABILITY_NEGATIVE_KEYWORDS = {
+    "plastic bottle",
+    "plastic container",
+    "plastic packaging",
+    "single-use",
+    "disposable",
+    "conventional",
+    "non-recyclable",
+    "styrofoam",
+    "pvc",
+    "vinyl",
+}
+
+
+def is_packaging_sustainable(packaging_text: str) -> dict:
+    """
+    Check if packaging description indicates sustainable materials.
+    
+    Args:
+        packaging_text: Description of packaging materials
+        
+    Returns:
+        {
+            "is_sustainable": bool,
+            "sustainable_materials": list of detected sustainable materials,
+            "non_sustainable_materials": list of detected non-sustainable materials,
+            "sustainability_score": int (0-100),
+            "recommendation": str
+        }
+    """
+    if not packaging_text:
+        return {
+            "is_sustainable": False,  # Unknown = assume not sustainable
+            "sustainable_materials": [],
+            "non_sustainable_materials": [],
+            "sustainability_score": 50,
+            "recommendation": "Packaging information not available"
+        }
+    
+    text_lower = packaging_text.lower()
+    
+    sustainable_found = []
+    non_sustainable_found = []
+    
+    # Check for sustainable materials
+    for material in SUSTAINABLE_PACKAGING_MATERIALS:
+        if material in text_lower:
+            sustainable_found.append(material)
+    
+    # Check for non-sustainable materials
+    for material in NON_SUSTAINABLE_PACKAGING_MATERIALS:
+        if material in text_lower:
+            non_sustainable_found.append(material)
+    
+    # Calculate sustainability score
+    score = 50  # Start neutral
+    score += len(sustainable_found) * 15  # Boost for each sustainable material
+    score -= len(non_sustainable_found) * 25  # Penalty for non-sustainable
+    score = max(0, min(100, score))  # Clamp to 0-100
+    
+    # Determine overall sustainability
+    is_sustainable = len(sustainable_found) > 0 and len(non_sustainable_found) == 0
+    
+    # Generate recommendation
+    if is_sustainable:
+        recommendation = "Eco-friendly packaging using sustainable materials"
+    elif len(non_sustainable_found) > 0:
+        recommendation = f"Contains non-sustainable packaging: {', '.join(non_sustainable_found[:3])}"
+    else:
+        recommendation = "Packaging sustainability uncertain"
+    
+    return {
+        "is_sustainable": is_sustainable,
+        "sustainable_materials": list(set(sustainable_found)),
+        "non_sustainable_materials": list(set(non_sustainable_found)),
+        "sustainability_score": score,
+        "recommendation": recommendation
+    }
+
+
+def check_product_sustainability(description: str, name: str = "") -> dict:
+    """
+    Check if a product description indicates it's sustainable/eco-friendly.
+    
+    Args:
+        description: Product description text
+        name: Product name (optional, for additional context)
+        
+    Returns:
+        {
+            "is_likely_sustainable": bool,
+            "positive_indicators": list of found sustainability keywords,
+            "negative_indicators": list of found problematic keywords,
+            "sustainability_score": int (0-100)
+        }
+    """
+    combined_text = f"{name} {description}".lower()
+    
+    positive_found = []
+    negative_found = []
+    
+    for keyword in SUSTAINABILITY_POSITIVE_KEYWORDS:
+        if keyword in combined_text:
+            positive_found.append(keyword)
+    
+    for keyword in SUSTAINABILITY_NEGATIVE_KEYWORDS:
+        if keyword in combined_text:
+            negative_found.append(keyword)
+    
+    # Calculate score
+    score = 50
+    score += len(positive_found) * 10
+    score -= len(negative_found) * 20
+    score = max(0, min(100, score))
+    
+    return {
+        "is_likely_sustainable": len(positive_found) > len(negative_found) and len(negative_found) == 0,
+        "positive_indicators": list(set(positive_found)),
+        "negative_indicators": list(set(negative_found)),
+        "sustainability_score": score
+    }
+
+
+def get_sustainability_requirements_prompt() -> str:
+    """
+    Get the sustainability requirements text to inject into AI prompts.
+    This ensures AI recommendations align with Hippiekit's sustainable values.
+    """
+    return """
+HIPPIEKIT SUSTAINABILITY REQUIREMENTS (CRITICAL - MUST FOLLOW):
+
+Hippiekit is a ZERO PLASTIC platform. ALL product recommendations MUST be 100% plastic-free.
+
+⚠️ IMPORTANT: "Glass bottle" is NOT automatically plastic-free! 
+Many glass bottles have PLASTIC CAPS, PLASTIC SEALS, or PLASTIC SHRINK WRAP.
+
+✅ TRULY PLASTIC-FREE PACKAGING (ONLY recommend these):
+- Glass with METAL/CORK/WOOD closures (NOT plastic caps)
+- Aluminum cans with aluminum pull-tabs (NOT plastic pour spouts)
+- Metal tins with metal lids
+- Paper/cardboard boxes with paper tape
+- Products with CORK stoppers (wine-style closures)
+- Bamboo containers with bamboo lids
+- Ceramic with cork/wood lids
+- Refillable containers at zero-waste stores
+- Package-free/bulk options (bring your own container)
+- Beeswax wraps
+- Compostable plant-based materials (verified, not "bio-plastic")
+
+❌ NOT ACCEPTABLE - DO NOT RECOMMEND:
+- Glass bottles with PLASTIC CAPS (very common - AVOID)
+- Glass jars with PLASTIC LINED LIDS
+- Metal cans with PLASTIC POUR SPOUTS
+- "Recyclable plastic" - still plastic, AVOID
+- Paper products with PLASTIC LINING (coffee cups, milk cartons)
+- Tetra Pak (has plastic layer)
+- Products with PLASTIC SHRINK WRAP or SEALS
+- Products with PLASTIC LABELS
+- ANY product where plastic touches the food/product
+- "BPA-free plastic" - still plastic, AVOID
+- Bioplastics/PLA - still plastic-derived, AVOID unless certified compostable
+
+🏆 TRULY ZERO-PLASTIC BRANDS TO PRIORITIZE:
+- Meliora (cleaning products in metal tins)
+- Ethique (solid bars in cardboard)
+- Plaine Products (aluminum bottles with metal pumps)
+- Package Free Shop brands
+- Zero Waste Store brands
+- Brands explicitly marketed as "100% plastic-free"
+- Local farmers market vendors
+- Bulk bin stores (bring your own container)
+
+FOR OLIVE OIL SPECIFICALLY:
+✅ ACCEPT: Glass bottle with CORK or METAL POUR SPOUT
+✅ ACCEPT: Metal tin (common in European imports)
+❌ REJECT: Glass bottle with plastic cap (most commercial olive oils)
+❌ REJECT: Glass bottle with plastic pour spout insert
+
+FOR FOOD PRODUCTS:
+✅ ACCEPT: Glass jars with metal twist-off lids (check lid doesn't have plastic liner)
+✅ ACCEPT: Metal cans (check no plastic pour spout)
+✅ ACCEPT: Paper/cardboard boxes with no plastic window
+❌ REJECT: Any plastic wrapper, cap, seal, liner, or component
+
+FOR PERSONAL CARE:
+✅ ACCEPT: Solid bars in cardboard/paper (shampoo bars, soap bars)
+✅ ACCEPT: Metal tins (deodorant, balms)
+✅ ACCEPT: Glass with metal pump (rare but exists - Plaine Products)
+❌ REJECT: Plastic tubes, plastic pump bottles, plastic caps
+
+IF NO PLASTIC-FREE OPTION EXISTS:
+1. First choice: Recommend a DIY/homemade alternative with recipe
+2. Second choice: Recommend buying from a zero-waste bulk store
+3. Third choice: Recommend the user contact brands to request plastic-free packaging
+4. Fourth choice: Recommend buying in largest size to minimize packaging per unit
+
+NEVER recommend a product with ANY plastic component, even if it's "mostly" sustainable.
+"""
+
+
 # Chemical Database with Categories, Aliases, and Severity
 CHEMICALS = {
     # ========== PRESERVATIVES & FORMALDEHYDE-RELEASERS ==========

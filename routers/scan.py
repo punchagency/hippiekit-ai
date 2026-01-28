@@ -18,7 +18,17 @@ from models import get_clip_embedder
 from services import get_pinecone_service
 from services.barcode_service import get_barcode_service
 from services.vision_service import get_vision_service
-from services.chemical_checker import check_ingredients, calculate_safety_score, generate_recommendations, load_harmful_chemicals_db
+from services.chemical_checker import (
+    check_ingredients, 
+    calculate_safety_score, 
+    generate_recommendations, 
+    load_harmful_chemicals_db,
+    check_product_sustainability,
+    is_packaging_sustainable,
+    get_sustainability_requirements_prompt,
+    SUSTAINABLE_PACKAGING_MATERIALS,
+    NON_SUSTAINABLE_PACKAGING_MATERIALS
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -837,6 +847,7 @@ async def filter_relevant_products(
 ) -> List[Dict[str, Any]]:
     """
     Use AI to filter out irrelevant product recommendations.
+    Also checks for SUSTAINABILITY - products with plastic packaging are penalized.
     
     Example: If user scanned "Skittles candy", filter out "mattresses" and "straws"
     even if they have visual similarity.
@@ -851,13 +862,22 @@ async def filter_relevant_products(
         is_clean_scan: Whether the scanned product has no harmful ingredients
         
     Returns:
-        Filtered list of relevant products only
+        Filtered list of relevant products only (with sustainable packaging prioritized)
     """
     if not candidate_products:
         return []
     
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
+        # Pre-filter: Check sustainability of each candidate
+        sustainability_scores = {}
+        for i, product in enumerate(candidate_products):
+            description = product.get('description', '')
+            name = product.get('name', '')
+            sustainability_check = check_product_sustainability(description, name)
+            sustainability_scores[i] = sustainability_check
+            logger.info(f"Sustainability check for {name}: score={sustainability_check['sustainability_score']}, positive={sustainability_check['positive_indicators'][:3] if sustainability_check['positive_indicators'] else []}")
         
         # Prepare candidate list for AI with enhanced metadata (categories + description)
         candidates_text = "\n".join([
@@ -885,42 +905,56 @@ Score 1-6 = Different product type (olive oil → castor oil = score 3)
         else:
             clean_scan_instructions = ""
         
-        prompt = f"""You are evaluating product recommendations for a health-conscious consumer.
+        sustainability_instructions = """
+SUSTAINABILITY CHECK (CRITICAL FOR HIPPIEKIT):
+- Products with sustainable packaging (glass, metal, paper, cardboard, compostable) get BONUS points (+2)
+- Products mentioning "plastic", "plastic bottle", "plastic container" get PENALTY (-3 points)
+- Products with eco-friendly keywords (organic, eco-friendly, sustainable, recyclable, refillable) get BONUS (+1)
+- NEVER give a score above 5 to products that explicitly mention plastic packaging
+- Hippiekit is an eco-conscious platform - sustainability matters as much as relevance!
+"""
+
+        prompt = f"""You are evaluating product recommendations for a health AND eco-conscious consumer on Hippiekit.
 
 Scanned Product: "{scanned_product_name}"
 Category: "{scanned_category}"
 {clean_scan_instructions}
+{sustainability_instructions}
+
 Candidate Recommendations (with categories & descriptions):
 {candidates_text}
 
-Task: Rate each candidate's RELEVANCE as a {"similar product" if is_clean_scan else "healthier alternative"} (1-10 scale):
+Task: Rate each candidate's OVERALL SCORE (1-10 scale) considering BOTH relevance AND sustainability:
+
+RELEVANCE (base score):
 - 10 = Perfect match (same {"product type" if is_clean_scan else "category, healthier version"})
 - 7-9 = Good match ({"closely related variant" if is_clean_scan else "related category, suitable alternative"})
 - 4-6 = Weak match (loosely related)
 - 1-3 = Irrelevant (completely different product {"type" if is_clean_scan else "category"})
 
+SUSTAINABILITY MODIFIERS:
+- +2 bonus if description mentions: glass, metal, aluminum, paper, cardboard, compostable, refillable, sustainable
+- -3 penalty if description mentions: plastic, plastic bottle, plastic container, non-recyclable
+- HARD RULE: Any product explicitly in plastic packaging = MAX score of 5
+
 Examples:
-{'''- Scanned "Organic Olive Oil" → Recommend "Extra Virgin Olive Oil" (score: 10)
-- Scanned "Organic Olive Oil" → Recommend "Cold-Pressed Olive Oil" (score: 10)
-- Scanned "Organic Olive Oil" → Recommend "Castor Oil" (score: 3)
-- Scanned "Smartwater" → Recommend "Stainless Steel Water Bottle" (score: 10)
-- Scanned "Smartwater" → Recommend "Metal Canteen" (score: 10)
-- Scanned "Smartwater" → Recommend "Plastic Water Bottle" (score: 2)''' if is_clean_scan else '''- Scanned "Skittles candy" → Recommend "Organic fruit gummies" (score: 10)
-- Scanned "Skittles candy" → Recommend "Organic chocolate" (score: 8) 
-- Scanned "Skittles candy" → Recommend "Reusable straw" (score: 1)
-- Scanned "Skittles candy" → Recommend "Mattress topper" (score: 1)'''}
+{'''- Scanned "Organic Olive Oil" → "Extra Virgin Olive Oil in glass bottle" (score: 10) ✓ sustainable
+- Scanned "Organic Olive Oil" → "Olive Oil in plastic bottle" (score: 4) ✗ plastic packaging
+- Scanned "Smartwater" → "Stainless Steel Water Bottle" (score: 10) ✓ sustainable & reusable
+- Scanned "Smartwater" → "Plastic Water Bottle" (score: 2) ✗ plastic!''' if is_clean_scan else '''- Scanned "Skittles candy" → "Organic fruit gummies in compostable bag" (score: 10)
+- Scanned "Skittles candy" → "Candy in plastic wrapper" (score: 4) ✗ plastic
+- Scanned "Shampoo" → "Shampoo bar in cardboard box" (score: 10) ✓ plastic-free
+- Scanned "Shampoo" → "Shampoo in plastic bottle" (score: 5) ✗ plastic'''}
 
-IMPORTANT: Use the categories and descriptions provided to make accurate relevance judgments.
+IMPORTANT: Hippiekit users CARE about sustainable packaging. Penalize plastic!
 
-Return ONLY a JSON array of relevance scores (1-10) for each candidate in order:
-[10, 8, 1, 1, ...]
-
-Be strict: Match product {"types" if is_clean_scan else "categories"} exactly. {"Same product type only for clean scans." if is_clean_scan else "Food replaces food. Beauty replaces beauty. Cleaning replaces cleaning."} Don't cross categories."""
+Return ONLY a JSON array of scores (1-10) for each candidate in order:
+[10, 8, 4, 2, ...]"""
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a product categorization expert. Return only JSON arrays with no explanation."},
+                {"role": "system", "content": "You are a product expert for an eco-conscious platform. Return only JSON arrays with no explanation. Penalize products with plastic packaging."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
@@ -937,17 +971,34 @@ Be strict: Match product {"types" if is_clean_scan else "categories"} exactly. {
         
         scores = json.loads(content)
         
-        # Filter products by relevance score
+        # Filter products by relevance score, applying additional sustainability adjustments
         relevant_products = []
         for i, product in enumerate(candidate_products):
-            if i < len(scores) and scores[i] >= min_relevance_score:
-                product['relevance_score'] = scores[i]
-                relevant_products.append(product)
+            if i < len(scores):
+                base_score = scores[i]
+                
+                # Apply additional sustainability penalty/bonus based on our check
+                sustainability_info = sustainability_scores.get(i, {})
+                
+                # Penalize products with negative sustainability indicators (plastic mentions)
+                if sustainability_info.get('negative_indicators'):
+                    base_score = min(base_score, 5)  # Cap at 5 if has negative indicators
+                    logger.info(f"Product {product.get('name')} capped at 5 due to sustainability concerns: {sustainability_info.get('negative_indicators')}")
+                
+                # Bonus for positive indicators
+                if sustainability_info.get('positive_indicators') and base_score < 10:
+                    bonus = min(2, len(sustainability_info.get('positive_indicators', [])))
+                    base_score = min(10, base_score + bonus)
+                
+                if base_score >= min_relevance_score:
+                    product['relevance_score'] = base_score
+                    product['sustainability_info'] = sustainability_info
+                    relevant_products.append(product)
         
         # Sort by relevance score (highest first)
         relevant_products.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
         
-        logger.info(f"AI relevance filtering: {len(relevant_products)}/{len(candidate_products)} products passed (min score: {min_relevance_score})")
+        logger.info(f"AI relevance + sustainability filtering: {len(relevant_products)}/{len(candidate_products)} products passed (min score: {min_relevance_score})")
         
         return relevant_products
         
@@ -969,6 +1020,11 @@ async def generate_ai_product_alternatives(
     For CLEAN SCANS: Recommend similar products of the same type (not "healthier" alternatives)
     For HARMFUL SCANS: Recommend healthier alternatives
     
+    ALL RECOMMENDATIONS MUST:
+    - Use sustainable packaging (glass, metal, paper, cardboard, compostable)
+    - NEVER recommend products in plastic packaging
+    - Prioritize eco-friendly, zero-waste brands
+    
     Args:
         product_name: Name of the scanned product
         category: Product category
@@ -983,116 +1039,225 @@ async def generate_ai_product_alternatives(
                 "brand": "Brand Name",
                 "description": "Why this is a healthier alternative",
                 "type": "ai_generated",
-                "logo_url": "URL to brand logo image (optional)"
+                "logo_url": "URL to brand logo image (optional)",
+                "packaging": "Sustainable packaging type"
             }
         ]
     """
     try:
         client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
+        # Get sustainability requirements to inject into prompt
+        sustainability_requirements = get_sustainability_requirements_prompt()
+        
         if is_clean_scan:
-            # For clean products - recommend SIMILAR products of the SAME TYPE
-            prompt = f"""You are a product expert. A customer scanned "{product_name}" (category: {category}) and it's a CLEAN product with no harmful additives.
+            # For clean products - recommend SIMILAR products of the SAME TYPE with 100% PLASTIC-FREE PACKAGING
+            prompt = f"""You are a product expert for Hippiekit, a ZERO PLASTIC sustainable product platform. A customer scanned "{product_name}" (category: {category}) and it's a CLEAN product with no harmful additives.
 
-Since this product is already clean and healthy, recommend {count} SIMILAR PRODUCTS of the SAME TYPE that they might also enjoy.
+Since this product is already clean and healthy, recommend {count} SIMILAR PRODUCTS of the SAME TYPE that are 100% PLASTIC-FREE.
 
-CRITICAL RULES:
-1. Use REAL brand names (e.g., "California Olive Ranch", "Bragg's", "Biona", "La Tourangelle")
-2. Match the EXACT product type - if they scanned olive oil, recommend OTHER OLIVE OILS (NOT castor oil, NOT coconut oil)
-3. For water products: Recommend METAL CANTEENS or STAINLESS STEEL BOTTLES (NOT plastic water bottles)
-4. Focus on quality brands they might not know about
-5. Be specific - same product category only
+{sustainability_requirements}
+
+⚠️ CRITICAL - "100% PLASTIC-FREE" MEANS ABSOLUTELY NO PLASTIC ANYWHERE:
+- NO plastic caps (even on glass bottles) - most glass bottles have plastic caps!
+- NO plastic seals, shrink wrap, or tamper bands
+- NO plastic pour spouts or dispensers
+- NO plastic liners inside metal lids
+- NO plastic labels or stickers
+- ZERO plastic components anywhere on the entire packaging
+
+✅ ONLY RECOMMEND PRODUCTS WITH THESE CLOSURES:
+- Metal tins with METAL lids (common for European olive oils, fish, etc.)
+- Glass with CORK stoppers (wine-style, some specialty oils)
+- Glass with METAL swing-top closures (Bormioli style)
+- Stainless steel with STAINLESS STEEL caps (no plastic gaskets)
+- Paper/cardboard with paper tape (no plastic windows)
+- BULK/REFILL: Bring your own container to zero-waste stores
+
+❌ AUTOMATICALLY DISQUALIFIED (DO NOT RECOMMEND):
+- "Glass bottle" without specifying cap material (assume plastic cap)
+- California Olive Ranch, Bragg's, Colavita, Kirkland - these have PLASTIC CAPS
+- Any product where you cannot verify the cap/closure is plastic-free
+
+FOR OLIVE OIL SPECIFICALLY:
+✅ Metal tins (La Española, some Italian imports)
+✅ Bulk stores with refill stations
+✅ Glass with cork (rare, specialty stores)
+❌ Most commercial "glass bottle" olive oils (have plastic caps)
 
 Format as JSON array:
 [
     {{
         "name": "Specific Product Name",
         "brand": "Actual Brand Name",
-        "description": "1-2 sentences explaining what makes this product great - mention quality, certifications, taste, etc."
+        "description": "MUST specify EXACT closure type - e.g., 'metal tin with metal pour spout' NOT just 'glass bottle'",
+        "packaging": "SPECIFIC: 'metal tin with metal lid' or 'glass with cork stopper' - specify closure material"
     }}
 ]
 
-Example (if product was "Organic Olive Oil"):
+Example (if product was "Olive Oil"):
 [
     {{
-        "name": "Extra Virgin Olive Oil",
-        "brand": "California Olive Ranch",
-        "description": "Award-winning California olive oil made from sustainably grown olives. Fresh, fruity flavor with a smooth finish. Certified extra virgin."
+        "name": "Extra Virgin Olive Oil in Metal Tin",
+        "brand": "La Española",
+        "description": "Premium Spanish olive oil in a METAL TIN with METAL pour spout. 100% plastic-free - the entire container is recyclable aluminum with no plastic components.",
+        "packaging": "metal tin with metal spout (verified 100% plastic-free)"
     }},
     {{
-        "name": "Organic Extra Virgin Olive Oil",
-        "brand": "Bragg's",
-        "description": "USDA certified organic olive oil cold-pressed from organic olives. Rich in antioxidants and healthy fats."
+        "name": "Bulk Olive Oil Refill",
+        "brand": "Zero Waste Store / Bulk Barn",
+        "description": "Bring your own GLASS JAR to fill from bulk dispensers. TRUE zero-waste - no packaging at all. Available at zero-waste stores, co-ops, and some Whole Foods.",
+        "packaging": "package-free (bring your own container)"
     }},
     {{
-        "name": "Italian Extra Virgin Olive Oil",
-        "brand": "La Tourangelle",
-        "description": "Traditional stone-pressed olive oil from Italy. Full-bodied flavor perfect for cooking and dressings."
+        "name": "DIY Herb-Infused Olive Oil",
+        "brand": "Homemade",
+        "description": "Buy olive oil in metal tin, infuse with rosemary/garlic at home. Store in your own GLASS JAR with METAL LID (like Mason jar). Full control over ingredients and packaging.",
+        "packaging": "DIY - use your own reusable glass jars with metal lids"
     }}
 ]
 
-Example (if product was "Bottled Water"):
+Example (if product was "Water"):
 [
     {{
-        "name": "Insulated Stainless Steel Water Bottle",
-        "brand": "Hydro Flask",
-        "description": "BPA-free stainless steel bottle keeps drinks cold for 24 hours. Durable, eco-friendly alternative to single-use plastic."
-    }},
-    {{
-        "name": "Stainless Steel Canteen",
+        "name": "Classic Stainless Steel Bottle",
         "brand": "Klean Kanteen",
-        "description": "Sustainable stainless steel bottle. Climate Neutral Certified. Keeps water fresh without plastic chemicals."
+        "description": "100% stainless steel bottle with STAINLESS STEEL loop cap - verified no plastic gaskets on their classic line. Climate Neutral Certified.",
+        "packaging": "stainless steel with metal cap (verified 100% plastic-free)"
+    }},
+    {{
+        "name": "Swing-Top Glass Bottle",
+        "brand": "Bormioli Rocco",
+        "description": "Italian glass bottle with traditional METAL swing-top closure using a RUBBER (not plastic) gasket. Infinitely reusable, dishwasher safe.",
+        "packaging": "glass with metal swing-top and rubber gasket"
     }}
 ]
 
-Now generate {count} SIMILAR products for "{product_name}" (category: {category}):"""
+IF NO 100% PLASTIC-FREE OPTION EXISTS FOR THIS PRODUCT:
+1. FIRST: Recommend BULK/ZERO-WASTE STORE option (bring your own container)
+2. SECOND: Recommend a DIY HOMEMADE alternative
+3. THIRD: Note that plastic-free options are limited and suggest alternatives
+DO NOT recommend products with plastic caps as "sustainable" - be honest!
+
+Now generate {count} VERIFIED 100% PLASTIC-FREE products for "{product_name}" (category: {category}):"""
         else:
-            # For harmful products - recommend healthier alternatives
-            prompt = f"""You are a health and eco-conscious product expert. A customer scanned "{product_name}" (category: {category}) and it contains harmful additives.
+            # For harmful products - recommend healthier alternatives with 100% PLASTIC-FREE PACKAGING
+            prompt = f"""You are a health and eco-conscious product expert for Hippiekit, a ZERO PLASTIC platform. A customer scanned "{product_name}" (category: {category}) and it contains harmful additives.
 
-Recommend {count} REAL, SPECIFIC healthier alternative products with ACTUAL BRAND NAMES that they can buy instead.
+Recommend {count} REAL, SPECIFIC healthier alternative products that are also 100% PLASTIC-FREE.
 
-CRITICAL RULES:
-1. Use REAL brand names (e.g., "Dr. Bronner's", "Seventh Generation", "Amy's Organic", "Honest Company")
-2. Focus on organic, plant-based, clean-label, eco-friendly brands
-3. Match the product category and use case (food for food, beauty for beauty, cleaning for cleaning)
-4. Explain WHY each alternative is healthier/cleaner (no harmful additives, organic ingredients, eco-friendly, etc.)
-5. Be specific - not generic suggestions
+{sustainability_requirements}
+
+⚠️ CRITICAL - "100% PLASTIC-FREE" MEANS ABSOLUTELY NO PLASTIC ANYWHERE:
+- NO plastic caps, lids, or closures (even on glass/metal containers)
+- NO plastic seals, shrink wrap, or tamper bands
+- NO plastic pour spouts, pumps, or dispensers
+- NO plastic liners inside lids
+- NO plastic wrappers or bags
+- NO plastic windows in boxes
+- ZERO plastic components on the entire packaging
+
+✅ ONLY RECOMMEND PRODUCTS WITH VERIFIED PLASTIC-FREE PACKAGING:
+- SOLID BARS in paper/cardboard (shampoo bars, soap bars, lotion bars)
+- METAL TINS with METAL lids (deodorant, balms, salves)
+- GLASS with METAL/CORK closures (verify no plastic cap!)
+- PAPER/CARDBOARD boxes with paper tape
+- COMPOSTABLE packaging (verified, not "bioplastic")
+- BULK/REFILL stations (bring your own container)
+- POWDER forms in paper packets (toothpaste tablets, laundry strips)
+
+❌ DO NOT RECOMMEND THESE (EVEN IF "ECO" BRANDED):
+- Dr. Bronner's liquid soap (plastic bottle/cap) - recommend their BAR SOAP instead
+- Seventh Generation (plastic bottles)
+- Method (plastic bottles)
+- Any product with plastic pump, cap, or dispenser
+- "Recyclable plastic" is still plastic - DO NOT RECOMMEND
+
+🏆 TRULY PLASTIC-FREE BRANDS:
+- Ethique (solid bars in cardboard)
+- Meliora (cleaning products in metal tins)
+- Plaine Products (aluminum with metal pumps)
+- Lush (naked/package-free products)
+- Bite (toothpaste tablets in glass with metal lid)
+- by Humankind (refillable with minimal plastic)
+- Zero Waste Store brands
+- Package Free Shop brands
 
 Format as JSON array:
 [
     {{
         "name": "Specific Product Name",
         "brand": "Actual Brand Name",
-        "description": "1-2 sentences explaining why this is a healthier alternative - mention clean ingredients, certifications, etc."
+        "description": "Why healthier + SPECIFIC packaging details including closure type",
+        "packaging": "SPECIFIC: 'solid bar in cardboard box' or 'metal tin with metal lid' - NOT vague"
     }}
 ]
 
-Example (if product was "Skittles"):
+Example (if product was "Conventional Shampoo"):
 [
     {{
-        "name": "Organic Fruit Chews",
-        "brand": "YumEarth",
-        "description": "Made with real fruit extracts and organic ingredients. Free from artificial dyes, high fructose corn syrup, and synthetic additives. Certified organic and allergy-friendly."
+        "name": "Shampoo Bar - Moisturizing",
+        "brand": "Ethique",
+        "description": "Concentrated solid shampoo with no sulfates or parabens. Packaged in COMPOSTABLE CARDBOARD BOX with paper insert. Equivalent to 3 plastic bottles. B Corp certified.",
+        "packaging": "compostable cardboard box with paper insert (verified 100% plastic-free)"
     }},
     {{
-        "name": "Fruity Snacks",
-        "brand": "Annie's Homegrown",
-        "description": "Uses natural fruit flavors and colors from vegetables and fruits. No synthetic dyes or artificial preservatives. Made with organic ingredients."
+        "name": "Shampoo Bar",
+        "brand": "Lush",
+        "description": "Solid shampoo bar sold NAKED (no packaging at all) or in recycled paper bag. Made with natural ingredients, no plastic waste.",
+        "packaging": "package-free or paper bag only"
     }},
     {{
-        "name": "Organic Gummy Bears",
-        "brand": "Black Forest",
-        "description": "Colored with natural fruit and vegetable juices instead of synthetic dyes. No high fructose corn syrup or artificial flavors."
+        "name": "Refillable Shampoo",
+        "brand": "Plaine Products",
+        "description": "Clean ingredients in ALUMINUM BOTTLE with METAL PUMP (one of the only plastic-free pump options). Return empties for refilling.",
+        "packaging": "aluminum bottle with metal pump (verified plastic-free)"
     }}
 ]
 
-Now generate {count} alternatives for "{product_name}" (category: {category}):"""
+Example (if product was "Candy with Artificial Dyes"):
+[
+    {{
+        "name": "Organic Chocolate Bar",
+        "brand": "Alter Eco",
+        "description": "Organic, fair trade chocolate in COMPOSTABLE plant-based wrapper and PAPER outer packaging. No artificial colors or flavors.",
+        "packaging": "compostable inner wrapper + paper box (verified plastic-free)"
+    }},
+    {{
+        "name": "Bulk Candy",
+        "brand": "Zero Waste Store",
+        "description": "Bring your own container to fill from bulk bins. Choose from organic gummies, chocolate, dried fruit. TRUE zero waste.",
+        "packaging": "package-free (bring your own container)"
+    }},
+    {{
+        "name": "Homemade Fruit Leather",
+        "brand": "DIY",
+        "description": "Blend organic fruit + dehydrate at home. Store in your own glass jars or beeswax wraps. No packaging waste, no artificial ingredients.",
+        "packaging": "DIY - store in your own reusable containers"
+    }}
+]
+
+IF NO 100% PLASTIC-FREE ALTERNATIVE EXISTS:
+1. FIRST: Recommend a DIY/HOMEMADE version with simple recipe
+2. SECOND: Recommend BULK STORE option (bring your own container)
+3. THIRD: Recommend the closest plastic-free option even if different product type
+4. Be HONEST - say if truly plastic-free options are limited
+
+Now generate {count} healthier, VERIFIED 100% PLASTIC-FREE alternatives for "{product_name}" (category: {category}):"""
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a health and eco-conscious product expert specializing in clean/natural alternatives across all consumer product categories (food, beauty, cleaning, personal care). You recommend specific real brands and products."},
+                {"role": "system", "content": """You are a product expert for Hippiekit, a ZERO PLASTIC sustainable platform.
+
+CRITICAL RULE: You must ONLY recommend products with 100% PLASTIC-FREE packaging.
+This means NO plastic caps, NO plastic seals, NO plastic components ANYWHERE.
+
+Most "glass bottle" products have PLASTIC CAPS - do not assume glass = plastic-free.
+When in doubt, recommend: bulk/refill stores, DIY alternatives, or solid bars.
+
+Prioritize: metal tins, solid bars in cardboard, bulk refills, true zero-waste options.
+NEVER recommend: plastic bottles, plastic caps on glass, plastic pumps, plastic wrappers."""},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,
